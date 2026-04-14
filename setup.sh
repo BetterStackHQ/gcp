@@ -96,16 +96,19 @@ if [ "$TEARDOWN" = true ]; then
 
   echo ""
   echo "Cancelling Dataflow job..."
-  JOB_ID=$(gcloud dataflow jobs list --region="$REGION" --project="$PROJECT" \
-    --filter="name~^${DATAFLOW_PREFIX}" --status=active --format='value(JOB_ID)' 2>/dev/null | head -1 || true)
-  if [ -n "$JOB_ID" ]; then
-    echo "  Cancelling $JOB_ID in $REGION..."
-    if ! gcloud dataflow jobs cancel "$JOB_ID" --region="$REGION" --project="$PROJECT" 2>&1; then
-      echo "  WARNING: Failed to cancel Dataflow job $JOB_ID"
-      ERRORS=$((ERRORS + 1))
-    fi
+  JOB_IDS=$(gcloud dataflow jobs list --region="$REGION" --project="$PROJECT" \
+    --filter="name~^${DATAFLOW_PREFIX} AND NOT state:(JOB_STATE_CANCELLED OR JOB_STATE_DONE OR JOB_STATE_FAILED OR JOB_STATE_DRAINED)" \
+    --format='value(JOB_ID)' 2>/dev/null || true)
+  if [ -n "$JOB_IDS" ]; then
+    while IFS= read -r JOB_ID; do
+      echo "  Cancelling $JOB_ID in $REGION..."
+      if ! gcloud dataflow jobs cancel "$JOB_ID" --region="$REGION" --project="$PROJECT" 2>&1; then
+        echo "  WARNING: Failed to cancel Dataflow job $JOB_ID"
+        ERRORS=$((ERRORS + 1))
+      fi
+    done <<< "$JOB_IDS"
   else
-    echo "  No active Dataflow job found in $REGION"
+    echo "  No active Dataflow jobs found in $REGION"
   fi
 
   echo "Deleting Pub/Sub subscription..."
@@ -392,6 +395,7 @@ fi
 
 # Grant WIF principal Workload Identity User on customer SA
 gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+  --project="$PROJECT" \
   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/betterstack-pool/attribute.sa_email/${BETTERSTACK_SA}" \
   --role="roles/iam.workloadIdentityUser" --quiet > /dev/null
 
@@ -444,9 +448,16 @@ else
 fi
 echo "  Exclusion: betterstack-logs-* dataflow job logs"
 
-gcloud pubsub topics add-iam-policy-binding "$TOPIC_NAME" \
-  --member="$WRITER" --role=roles/pubsub.publisher \
-  --project="$PROJECT" --quiet > /dev/null
+# The logging service account may take a moment to propagate after sink creation
+for i in 1 2 3 4 5; do
+  if gcloud pubsub topics add-iam-policy-binding "$TOPIC_NAME" \
+    --member="$WRITER" --role=roles/pubsub.publisher \
+    --project="$PROJECT" --quiet > /dev/null 2>&1; then
+    break
+  fi
+  echo "  Waiting for logging service account to propagate (attempt $i/5)..."
+  sleep 10
+done
 
 echo "  Writer: $WRITER"
 echo ""
