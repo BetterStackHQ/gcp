@@ -187,6 +187,7 @@ resource "google_project_iam_member" "dataflow_roles" {
 # --- Dataflow job ---
 
 resource "google_dataflow_flex_template_job" "logs" {
+  provider                = google-beta
   project                 = var.project_id
   name                    = local.dataflow_name
   container_spec_gcs_path = "gs://betterstack/pubsub-to-betterstack.json"
