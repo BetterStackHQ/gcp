@@ -23,7 +23,7 @@ Two modes:
 ```hcl
 # Org mode (all projects):
 module "betterstack" {
-  source        = "github.com/betterstack/gcp-integration//terraform"
+  source        = "github.com/BetterStackHQ/gcp//terraform"
   project_id    = "my-project"
   org_id        = "123456789"
   source_token  = "<source-token>"
@@ -32,7 +32,7 @@ module "betterstack" {
 
 # Project mode (single project only):
 module "betterstack" {
-  source        = "github.com/betterstack/gcp-integration//terraform"
+  source        = "github.com/BetterStackHQ/gcp//terraform"
   project_id    = "my-project"
   source_token  = "<source-token>"
   ingesting_host = "<ingesting-host>"
