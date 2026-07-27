@@ -65,7 +65,7 @@ See the [Terraform module README](terraform/README.md) for full usage and variab
 
 ```hcl
 module "betterstack" {
-  source         = "github.com/betterstack/gcp-integration//terraform"
+  source         = "github.com/BetterStackHQ/gcp//terraform"
   project_id     = "my-project"
   org_id         = "123456789"
   source_token   = var.source_token
