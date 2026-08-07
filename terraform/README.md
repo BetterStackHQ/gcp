@@ -39,6 +39,13 @@ module "betterstack" {
 }
 ```
 
+## Connecting the source with Terraform
+
+The `source_token` and `ingesting_host` above come from a Better Stack source, and the `project_id` / `project_number` outputs have to be configured back in Better Stack.
+
+Both handoffs can be Terraform-managed with the [Better Stack Telemetry provider](https://registry.terraform.io/providers/BetterStackHQ/logtail/latest),
+so the whole integration applies in a single run. See [Connecting a GCP project to a source](https://registry.terraform.io/providers/BetterStackHQ/logtail/latest/docs/guides/connect-gcp-project) for details.
+
 ## Variables
 
 | Name | Description | Required | Default |
