@@ -13,6 +13,7 @@ locals {
   dataflow_name    = "betterstack-logs-${local.source_id}"
 
   apis = [
+    "serviceusage.googleapis.com",
     "dataflow.googleapis.com",
     "pubsub.googleapis.com",
     "logging.googleapis.com",
