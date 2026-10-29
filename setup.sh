@@ -362,7 +362,7 @@ echo ""
 # --- Step 1: Enable APIs ---
 echo "Step 1: Enabling APIs..."
 
-APIS=(logging monitoring compute cloudasset iamcredentials)
+APIS=(serviceusage logging monitoring compute cloudasset iamcredentials)
 if [ "$SKIP_LOG_FORWARDING" = false ]; then
   APIS+=(dataflow pubsub)
 fi
