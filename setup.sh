@@ -400,9 +400,16 @@ ai_sre_drop_restored_ingestion_provider() {
   ai_sre_probe iam workload-identity-pools providers describe betterstack-provider \
     --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
   [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ] || return 0
-  ai_sre_probe iam service-accounts describe "betterstack-integration@${AI_SRE_PROJECT}.iam.gserviceaccount.com" \
-    --project="$AI_SRE_PROJECT" --format='value(email)'
-  [ -z "$AI_SRE_OUT" ] || return 0
+  # Delete only when gcloud says the service account doesn't exist: any other error keeps the provider.
+  if ! gcloud iam service-accounts describe "betterstack-integration@${AI_SRE_PROJECT}.iam.gserviceaccount.com" \
+    --project="$AI_SRE_PROJECT" --format='value(email)' >/dev/null 2>"$AI_SRE_TMP/gcloud.err"; then
+    if ! grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
+      echo "  Kept the restored ingestion provider betterstack-provider: could not check whether the ingestion setup still uses it."
+      return 0
+    fi
+  else
+    return 0
+  fi
   ai_sre_gcloud "Deleting the restored provider betterstack-provider" \
     "roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}" \
     iam workload-identity-pools providers delete betterstack-provider \

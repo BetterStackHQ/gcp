@@ -730,6 +730,21 @@ test_restored_pool_drops_unused_ingestion_provider() {
   refute_output "Deleted the restored ingestion provider"
 }
 
+test_restored_pool_keeps_provider_when_check_fails() {
+  start_case restored_pool_check_fails
+  echo DELETED >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider" "$MOCK/state/sa-betterstack-integration@pool-proj.iam.gserviceaccount.com"
+  export MOCK_FAIL_PATTERN="service-accounts describe betterstack-integration@"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)."
+  run_setup --ai-sre "$TOKEN"
+  assert_status 0
+  assert_call "gcloud iam service-accounts describe betterstack-integration@pool-proj.iam.gserviceaccount.com"
+  refute_call "providers delete"
+  refute_output "Deleted the restored ingestion provider"
+  assert_output "Kept the restored ingestion provider betterstack-provider: could not check whether the ingestion setup still uses it."
+  assert_output "AI SRE setup complete!"
+}
+
 test_ingestion_mode_still_works() {
   start_case ingestion
   run_setup --project=pool-proj --region=europe-west1 --source-token=src-token --ingesting-host=s1234.eu-nbg-2.betterstackdata.com
