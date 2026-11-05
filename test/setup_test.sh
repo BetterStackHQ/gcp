@@ -499,7 +499,23 @@ test_argument_errors() {
   assert_status 1
   assert_output "--ai-sre needs the registration token"
 
+  run_setup --ai-sre --project pool-proj
+  assert_status 1
+  assert_output "--ai-sre needs the registration token"
+
+  run_setup --ai-sre "$TOKEN" --services --audit-logs
+  assert_status 1
+  assert_output "--services needs a value."
+
+  run_setup --ai-sre "$TOKEN" --project example.com:my-proj
+  assert_status 1
+  assert_output "domain-scoped projects are not supported"
+
   run_setup --ai-sre "$TOKEN" --region=europe-west1
+  assert_status 1
+  assert_output "can't be combined with the ingestion options"
+
+  run_setup --ai-sre "$TOKEN" --batch-count=50
   assert_status 1
   assert_output "can't be combined with the ingestion options"
 
@@ -513,6 +529,26 @@ test_argument_errors() {
   assert_output "--ai-sre <token>"
   assert_output "--audit-logs"
   assert_output "billed"
+}
+
+test_disabled_pool_and_provider_are_enabled() {
+  start_case disabled
+  printf 'ACTIVE\tTrue\n' >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-ai-sre"
+  run_setup --ai-sre "$TOKEN"
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools update betterstack-pool --location=global --project=pool-proj --no-disabled"
+  assert_call "--attribute-condition=assertion.email=='$CALLER' --no-disabled"
+}
+
+test_lost_registration_answer() {
+  start_case lost_answer
+  post_responses '502 <html>Bad Gateway</html>' '401 {"error": "Token already used"}'
+  run_setup --ai-sre "$TOKEN"
+  assert_status 1
+  assert_call_count "curl POST" 2
+  assert_output "That attempt may have registered the project"
+  refute_output "Get a new command"
 }
 
 test_ingestion_mode_still_works() {

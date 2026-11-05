@@ -188,12 +188,12 @@ ai_sre_gcloud() {
     AI_SRE_OUT=""
     return 0
   fi
-  for attempt in 1 2 3 4 5 6; do
+  for attempt in $(seq 1 12); do
     status=0
     AI_SRE_OUT=$(gcloud "$@" 2>"$AI_SRE_TMP/gcloud.err") || status=$?
     [ "$status" -eq 0 ] && return 0
-    # A service account created a moment ago can take a few seconds to reach IAM.
-    if [ "$attempt" -lt 6 ] && grep -qiE "service ?account .*does not exist" "$AI_SRE_TMP/gcloud.err"; then
+    # A service account created a moment ago can take up to a minute to reach IAM.
+    if [ "$attempt" -lt 12 ] && grep -qiE "service ?account .*does not exist" "$AI_SRE_TMP/gcloud.err"; then
       sleep 5
       continue
     fi
@@ -342,10 +342,15 @@ ai_sre_ensure_pool() {
   local role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
   echo "Setting up workload identity pool ${AI_SRE_POOL}..."
   ai_sre_probe iam workload-identity-pools describe "$AI_SRE_POOL" \
-    --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+    --location=global --project="$AI_SRE_PROJECT" --format='value(state,disabled)'
   case "$AI_SRE_OUT" in
-    ACTIVE) echo "  Reusing existing pool." ;;
-    DELETED)
+    ACTIVE*True*)
+      echo "  Reusing existing pool, which is disabled: enabling it."
+      ai_sre_gcloud "Enabling pool ${AI_SRE_POOL}" "$role" \
+        iam workload-identity-pools update "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --no-disabled
+      ;;
+    ACTIVE*) echo "  Reusing existing pool." ;;
+    DELETED*)
       ai_sre_gcloud "Restoring pool ${AI_SRE_POOL}" "$role" \
         iam workload-identity-pools undelete "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
       ;;
@@ -370,6 +375,7 @@ ai_sre_ensure_provider() {
   echo "Setting up identity provider ${AI_SRE_PROVIDER} (accepts only ${AI_SRE_CALLER})..."
   ai_sre_probe iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
     --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+  AI_SRE_OUT=$(tr -d '[:space:]' <<<"$AI_SRE_OUT")
   if [ "$AI_SRE_OUT" = "DELETED" ]; then
     ai_sre_gcloud "Restoring provider ${AI_SRE_PROVIDER}" "$role" \
       iam workload-identity-pools providers undelete "$AI_SRE_PROVIDER" \
@@ -378,7 +384,7 @@ ai_sre_ensure_provider() {
   fi
   if [ "$AI_SRE_OUT" = "ACTIVE" ]; then
     ai_sre_gcloud "Updating provider ${AI_SRE_PROVIDER}" "$role" \
-      iam workload-identity-pools providers update-oidc "$AI_SRE_PROVIDER" "${args[@]}"
+      iam workload-identity-pools providers update-oidc "$AI_SRE_PROVIDER" "${args[@]}" --no-disabled
   else
     ai_sre_gcloud "Creating provider ${AI_SRE_PROVIDER}" "$role" \
       iam workload-identity-pools providers create-oidc "$AI_SRE_PROVIDER" "${args[@]}" \
@@ -453,7 +459,7 @@ else:
 }
 
 ai_sre_register() {
-  local body waited=0 delay=5 retryable
+  local body waited=0 delay=5 retryable unanswered=false
   body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3]}))' \
     "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA")
   echo "Registering ${AI_SRE_PROJECT} with Better Stack..."
@@ -462,7 +468,16 @@ ai_sre_register() {
     case "$AI_SRE_STATUS" in
       dry-run) return 0 ;;
       200|201) return 0 ;;
-      401) ai_sre_token_rejected ;;
+      401)
+        if [ "$unanswered" = true ]; then
+          echo ""
+          echo "Error: Better Stack rejected the token on a retry, after an earlier attempt got no answer."
+          echo "  That attempt may have registered the project, which uses up the token. Check the"
+          echo "  integration in Better Stack: if ${AI_SRE_PROJECT} is listed, the setup is complete."
+          exit 1
+        fi
+        ai_sre_token_rejected
+        ;;
       422)
         retryable=$(ai_sre_json retryable)
         if [ "$retryable" != "true" ]; then
@@ -471,7 +486,8 @@ ai_sre_register() {
           exit 1
         fi
         ;;
-      429|5??|000) ;;
+      429) ;;
+      5??|000) unanswered=true ;;
       *)
         echo ""
         echo "Error: Registration failed ($(ai_sre_api_error))."
@@ -504,8 +520,9 @@ ai_sre_main() {
     ai_sre_error "The registration token has unexpected characters. Copy the command from Better Stack again."
   fi
   if [ "$TEARDOWN" = true ] || [ "$SKIP_LOG_FORWARDING" = true ] || [ -n "$ORG_ID" ] || [ -n "$REGION" ] \
-    || [ -n "${SOURCE_TOKEN:-}" ] || [ -n "${INGESTING_HOST:-}" ]; then
-    ai_sre_error "--ai-sre can't be combined with the ingestion options (--teardown, --org-id, --region, --source-token, --ingesting-host, --skip-log-forwarding)."
+    || [ -n "${SOURCE_TOKEN:-}" ] || [ -n "${INGESTING_HOST:-}" ] \
+    || [ "$BETTERSTACK_SA" != "gcp-integration@better-stack.iam.gserviceaccount.com" ] || [ "$BATCH_COUNT" != "100" ]; then
+    ai_sre_error "--ai-sre can't be combined with the ingestion options (--teardown, --org-id, --region, --source-token, --ingesting-host, --skip-log-forwarding, --betterstack-sa, --batch-count)."
   fi
   AI_SRE_API_URL="${AI_SRE_API_URL%/}"
   [[ "$AI_SRE_API_URL" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || ai_sre_error "--api-url must be an http(s) URL."
@@ -564,7 +581,7 @@ ai_sre_main() {
       [ -n "$AI_SRE_PROJECT" ] || ai_sre_error "No project given and no current gcloud project. Pass --project <id>."
     fi
   fi
-  [[ "$AI_SRE_PROJECT" =~ ^[a-z0-9.:-]+$ ]] || ai_sre_error "'${AI_SRE_PROJECT}' is not a valid project ID."
+  [[ "$AI_SRE_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || ai_sre_error "'${AI_SRE_PROJECT}' is not a valid project ID (domain-scoped projects are not supported)."
 
   if [ -z "$AI_SRE_KNOWN_POOL_PROJECT" ] || [ "$AI_SRE_KNOWN_POOL_PROJECT" = "$AI_SRE_PROJECT" ]; then
     AI_SRE_MODE="pool"
@@ -644,11 +661,11 @@ while [ $# -gt 0 ]; do
     --skip-log-forwarding) SKIP_LOG_FORWARDING=true; shift ;;
     --teardown) TEARDOWN=true; shift ;;
     --ai-sre=*) AI_SRE=true; AI_SRE_TOKEN="${1#*=}"; shift ;;
-    --ai-sre) AI_SRE=true; AI_SRE_TOKEN="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --ai-sre) AI_SRE=true; if [[ "${2:--}" != -* ]]; then AI_SRE_TOKEN="$2"; shift; fi; shift ;;
     --services=*) AI_SRE_SERVICES="${1#*=}"; shift ;;
-    --services) AI_SRE_SERVICES="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --services) [[ "${2:--}" != -* ]] || { echo "Error: --services needs a value."; exit 1; }; AI_SRE_SERVICES="$2"; shift 2 ;;
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
-    --api-url) AI_SRE_API_URL="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
     --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown argument: $1"; echo "Run with --help for usage."; exit 1 ;;
