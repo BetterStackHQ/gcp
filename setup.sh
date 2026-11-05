@@ -125,6 +125,15 @@ ai_sre_service_role() {
   esac
 }
 
+# Whether a value is one of this script's own options (so --ai-sre got no token).
+ai_sre_is_option() {
+  case "${1%%=*}" in
+    --help|-h|--project|--org-id|--source-token|--ingesting-host|--betterstack-sa|--region|--batch-count \
+      |--skip-log-forwarding|--teardown|--ai-sre|--services|--api-url|--audit-logs|--dry-run) return 0 ;;
+  esac
+  return 1
+}
+
 ai_sre_error() {
   echo ""
   echo "Error: $*"
@@ -273,9 +282,30 @@ ai_sre_token_rejected() {
   exit 1
 }
 
+# ai_sre_retry_wait <what>: waits before retrying a Better Stack call, backing off
+# from 5 to 30 seconds. Fails once the next wait would pass AI_SRE_REGISTER_TIMEOUT.
+# Reset AI_SRE_WAITED=0 and AI_SRE_DELAY=5 before the first call.
+ai_sre_retry_wait() {
+  [ $((AI_SRE_WAITED + AI_SRE_DELAY)) -le "$AI_SRE_REGISTER_TIMEOUT" ] || return 1
+  echo "  $1 ($(ai_sre_api_error)); retrying in ${AI_SRE_DELAY}s..."
+  sleep "$AI_SRE_DELAY"
+  AI_SRE_WAITED=$((AI_SRE_WAITED + AI_SRE_DELAY))
+  AI_SRE_DELAY=$((AI_SRE_DELAY * 2))
+  [ "$AI_SRE_DELAY" -gt 30 ] && AI_SRE_DELAY=30
+  return 0
+}
+
 ai_sre_fetch_audience() {
   echo "Fetching the integration's details from Better Stack..."
-  ai_sre_api GET /api/v1/ai-sre/gcp-registrations/audience
+  AI_SRE_WAITED=0
+  AI_SRE_DELAY=5
+  while true; do
+    ai_sre_api GET /api/v1/ai-sre/gcp-registrations/audience
+    case "$AI_SRE_STATUS" in
+      429|5??|000) ai_sre_retry_wait "Better Stack is not answering yet" || break ;;
+      *) break ;;
+    esac
+  done
   if [ "$DRY_RUN" = true ]; then
     AI_SRE_AUDIENCE="AUDIENCE_FROM_BETTER_STACK"
     AI_SRE_KNOWN_POOL_PROJECT=""
@@ -298,8 +328,9 @@ ai_sre_fetch_audience() {
   local caller
   caller=$(ai_sre_json caller_service_account)
 
-  # The audience becomes the provider's only allowed audience: one https URL, no commas.
-  if ! [[ "$AI_SRE_AUDIENCE" =~ ^https://[A-Za-z0-9._~:/?#@!\$\&\'\(\)*+\;=%-]+$ ]] || [[ "$AI_SRE_AUDIENCE" == *,* ]]; then
+  # The audience becomes the provider's only allowed audience: one plain https URL
+  # (https://betterstack.com/ai-sre/gcp/<uuid>), with no characters gcloud or a shell could misread.
+  if ! [[ "$AI_SRE_AUDIENCE" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~-]+)+$ ]]; then
     ai_sre_error "Better Stack returned an unexpected audience: '${AI_SRE_AUDIENCE}'."
   fi
   if [ -n "$caller" ] && [ "$caller" != "$AI_SRE_CALLER" ]; then
@@ -459,10 +490,14 @@ else:
 }
 
 ai_sre_register() {
-  local body waited=0 delay=5 retryable unanswered=false
+  local body retryable unanswered=false
   body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3]}))' \
     "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA")
   echo "Registering ${AI_SRE_PROJECT} with Better Stack..."
+  echo "  Better Stack checks that it can use the new access. Google can take a few minutes"
+  echo "  to apply IAM changes, so this retries for up to $((AI_SRE_REGISTER_TIMEOUT / 60)) minutes."
+  AI_SRE_WAITED=0
+  AI_SRE_DELAY=5
   while true; do
     ai_sre_api POST /api/v1/ai-sre/gcp-registrations "$body"
     case "$AI_SRE_STATUS" in
@@ -495,25 +530,20 @@ ai_sre_register() {
         exit 1
         ;;
     esac
-    if [ $((waited + delay)) -gt "$AI_SRE_REGISTER_TIMEOUT" ]; then
+    if ! ai_sre_retry_wait "Not ready yet"; then
       echo ""
-      echo "Error: Better Stack could not use the new access after ${waited} seconds ($(ai_sre_api_error))."
+      echo "Error: Better Stack could not use the new access after ${AI_SRE_WAITED} seconds ($(ai_sre_api_error))."
       echo "  Google can take several minutes to apply IAM changes."
       ai_sre_rerun_hint
       exit 1
     fi
-    echo "  Not ready yet ($(ai_sre_api_error)). Google can take a few minutes to apply IAM changes; retrying in ${delay}s..."
-    sleep "$delay"
-    waited=$((waited + delay))
-    delay=$((delay * 2))
-    [ "$delay" -gt 30 ] && delay=30
   done
 }
 
 ai_sre_main() {
   local service api
 
-  if [ -z "$AI_SRE_TOKEN" ] || [[ "$AI_SRE_TOKEN" == -* ]]; then
+  if [ -z "$AI_SRE_TOKEN" ] || ai_sre_is_option "$AI_SRE_TOKEN"; then
     ai_sre_error "--ai-sre needs the registration token shown on the GCP integration in Better Stack."
   fi
   if ! [[ "$AI_SRE_TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
@@ -525,7 +555,7 @@ ai_sre_main() {
     ai_sre_error "--ai-sre can't be combined with the ingestion options (--teardown, --org-id, --region, --source-token, --ingesting-host, --skip-log-forwarding, --betterstack-sa, --batch-count)."
   fi
   AI_SRE_API_URL="${AI_SRE_API_URL%/}"
-  [[ "$AI_SRE_API_URL" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || ai_sre_error "--api-url must be an http(s) URL."
+  [[ "$AI_SRE_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || ai_sre_error "--api-url must be an https URL."
 
   AI_SRE_ROLES_TO_GRANT=("${AI_SRE_ROLES[@]}")
   AI_SRE_APIS_TO_ENABLE=("${AI_SRE_APIS[@]}")
@@ -661,14 +691,28 @@ while [ $# -gt 0 ]; do
     --skip-log-forwarding) SKIP_LOG_FORWARDING=true; shift ;;
     --teardown) TEARDOWN=true; shift ;;
     --ai-sre=*) AI_SRE=true; AI_SRE_TOKEN="${1#*=}"; shift ;;
-    --ai-sre) AI_SRE=true; if [[ "${2:--}" != -* ]]; then AI_SRE_TOKEN="$2"; shift; fi; shift ;;
+    --ai-sre)
+      # Tokens can start with "-", so take any next value that isn't one of this script's options.
+      AI_SRE=true
+      if [ $# -ge 2 ] && ! ai_sre_is_option "$2"; then AI_SRE_TOKEN="$2"; shift; fi
+      shift
+      ;;
     --services=*) AI_SRE_SERVICES="${1#*=}"; shift ;;
     --services) [[ "${2:--}" != -* ]] || { echo "Error: --services needs a value."; exit 1; }; AI_SRE_SERVICES="$2"; shift 2 ;;
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
     --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
     --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
-    *) echo "Unknown argument: $1"; echo "Run with --help for usage."; exit 1 ;;
+    *)
+      # Show only an option's name: a stray value may be a token.
+      if [[ "${1%%=*}" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
+        echo "Unknown argument: ${1%%=*}"
+      else
+        echo "Unknown argument (value not shown, in case it is a secret)."
+      fi
+      echo "Run with --help for usage."
+      exit 1
+      ;;
   esac
 done
 
@@ -784,11 +828,25 @@ if [ "$TEARDOWN" = true ]; then
     fi
   fi
 
-  echo "Deleting WIF pool (cascades providers)..."
-  if ! gcloud iam workload-identity-pools delete betterstack-pool \
-    --location=global --project="$PROJECT" --quiet 2>&1; then
-    echo "  WARNING: Failed to delete WIF pool"
-    ERRORS=$((ERRORS + 1))
+  # The AI SRE setup (--ai-sre) keeps its own provider in the same pool: keep the pool for it.
+  AI_SRE_PROVIDER_STATE=$(gcloud iam workload-identity-pools providers describe betterstack-ai-sre \
+    --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" \
+    --format='value(state)' 2>/dev/null || true)
+  if [ "$AI_SRE_PROVIDER_STATE" = "ACTIVE" ]; then
+    echo "Keeping WIF pool betterstack-pool: it also holds the betterstack-ai-sre provider used by Better Stack AI SRE."
+    echo "Deleting WIF provider betterstack-provider..."
+    if ! gcloud iam workload-identity-pools providers delete betterstack-provider \
+      --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" --quiet 2>&1; then
+      echo "  WARNING: Failed to delete WIF provider"
+      ERRORS=$((ERRORS + 1))
+    fi
+  else
+    echo "Deleting WIF pool (cascades providers)..."
+    if ! gcloud iam workload-identity-pools delete betterstack-pool \
+      --location=global --project="$PROJECT" --quiet 2>&1; then
+      echo "  WARNING: Failed to delete WIF pool"
+      ERRORS=$((ERRORS + 1))
+    fi
   fi
 
   echo "Removing IAM bindings..."

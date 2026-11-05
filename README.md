@@ -52,6 +52,8 @@ The fastest way to deploy. Requires the [gcloud CLI](https://cloud.google.com/sd
 
 ### Teardown
 
+If the AI SRE setup (`--ai-sre`) added its provider to `betterstack-pool`, teardown keeps the pool and deletes only the ingestion provider.
+
 ```bash
 ./setup.sh --teardown \
   --project=my-project \
@@ -105,7 +107,7 @@ The first project also enables `iam`, `iamcredentials` and `sts`. The script the
 
 ### Permissions and errors
 
-The user running the script needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` (only the last two in further projects). When a step is denied, the script names the missing permission and the role that grants it.
+The user running the script needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` (only `roles/serviceusage.serviceUsageAdmin` and `roles/resourcemanager.projectIamAdmin` in further projects). When a step is denied, the script names the missing permission and the role that grants it.
 
 If your organization restricts identity providers with `constraints/iam.workloadIdentityPoolProviders`, creating the provider fails and the script prints the command that allows `https://accounts.google.com`, which needs `roles/orgpolicy.policyAdmin`:
 

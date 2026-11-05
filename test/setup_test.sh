@@ -95,8 +95,8 @@ MOCK
 
   cat >"$WORK/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
-# Mock curl. Answers come from $MOCK/audience.response (one "STATUS BODY" line)
-# and $MOCK/post.responses (one "STATUS BODY" line per call; the last one repeats).
+# Mock curl. Answers come from $MOCK/audience.response and $MOCK/post.responses,
+# one "STATUS BODY" line per call; the last one repeats.
 set -u
 method=GET out="" write_out="" data="" url="" auth=""
 while [ $# -gt 0 ]; do
@@ -118,6 +118,13 @@ while [ $# -gt 0 ]; do
 done
 echo "curl $method $url auth=[$auth] data=[$data]" >>"$MOCK/calls.log"
 
+next_response() { # next_response <file>: pops the first line, keeping the last one
+  head -n 1 "$1"
+  if [ "$(wc -l <"$1")" -gt 1 ]; then
+    tail -n +2 "$1" >"$1.next" && mv "$1.next" "$1"
+  fi
+}
+
 respond() { # respond <"STATUS BODY">
   local status="${1%% *}" body="${1#* }"
   if [ -n "$out" ]; then printf '%s' "$body" >"$out"; else printf '%s' "$body"; fi
@@ -130,14 +137,8 @@ case "$url" in
   *:testIamPermissions)
     respond "200 $(python3 -c 'import json,sys; print(json.dumps({"permissions": json.loads(sys.argv[1])["permissions"]}))' "$data")"
     ;;
-  */api/v1/ai-sre/gcp-registrations/audience) respond "$(cat "$MOCK/audience.response")" ;;
-  */api/v1/ai-sre/gcp-registrations)
-    line=$(head -n 1 "$MOCK/post.responses")
-    if [ "$(wc -l <"$MOCK/post.responses")" -gt 1 ]; then
-      tail -n +2 "$MOCK/post.responses" >"$MOCK/post.next" && mv "$MOCK/post.next" "$MOCK/post.responses"
-    fi
-    respond "$line"
-    ;;
+  */api/v1/ai-sre/gcp-registrations/audience) respond "$(next_response "$MOCK/audience.response")" ;;
+  */api/v1/ai-sre/gcp-registrations) respond "$(next_response "$MOCK/post.responses")" ;;
   *) echo "mock curl: unexpected URL $url" >&2; exit 2 ;;
 esac
 MOCK
@@ -166,12 +167,22 @@ start_case() {
 }
 
 audience_response() { echo "$1 $2" >"$MOCK/audience.response"; }
+audience_responses() { printf '%s\n' "$@" >"$MOCK/audience.response"; }
 post_responses() { printf '%s\n' "$@" >"$MOCK/post.responses"; }
 
 # run_setup <args...>: runs setup.sh with the mocks; sets OUTPUT and STATUS.
 run_setup() {
   : >"$MOCK/calls.log"
   OUTPUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" "$@" 2>&1 </dev/null)
+  STATUS=$?
+}
+
+# run_setup_answering <answer> <args...>: like run_setup, typing <answer> at the prompt.
+run_setup_answering() {
+  local answer="$1"
+  shift
+  : >"$MOCK/calls.log"
+  OUTPUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" "$@" 2>&1 <<<"$answer")
   STATUS=$?
 }
 
@@ -549,6 +560,111 @@ test_lost_registration_answer() {
   assert_call_count "curl POST" 2
   assert_output "That attempt may have registered the project"
   refute_output "Get a new command"
+}
+
+test_token_starting_with_a_dash() {
+  local dash_token="-Xq3vR8_kLm0pZ2aB4cD6eF8gH0iJ2kL4mN6oP8qR0s"
+  start_case dash_token
+  run_setup --ai-sre "$dash_token" --project pool-proj
+  assert_status 0
+  assert_call "curl GET https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations/audience auth=[Authorization: Bearer $dash_token]"
+  assert_output "AI SRE setup complete!"
+  refute_output "$dash_token"
+
+  start_case dash_token_equals
+  run_setup "--ai-sre=$dash_token"
+  assert_status 0
+  assert_call "auth=[Authorization: Bearer $dash_token]"
+  refute_output "$dash_token"
+
+  start_case empty_token
+  run_setup --ai-sre=
+  assert_status 1
+  assert_output "--ai-sre needs the registration token"
+  refute_call "curl"
+}
+
+test_unknown_argument_is_not_echoed() {
+  start_case unknown_value
+  run_setup --project pool-proj s3cr3t-looking-value
+  assert_status 1
+  assert_output "Unknown argument"
+  refute_output "s3cr3t-looking-value"
+
+  run_setup --no-such-flag=s3cr3t-looking-value
+  assert_status 1
+  assert_output "Unknown argument: --no-such-flag"
+  refute_output "s3cr3t-looking-value"
+}
+
+test_audience_fetch_is_retried() {
+  start_case audience_retry
+  audience_responses \
+    '503 {"error": "Service unavailable"}' \
+    '429 {"error": "Rate limited"}' \
+    "200 {\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"pool_project_id\": null, \"pool_project_number\": null, \"service_account_email\": null, \"project_ids\": []}"
+  run_setup --ai-sre "$TOKEN"
+  assert_status 0
+  assert_call_count "curl GET" 3
+  assert_call "sleep 5"
+  assert_call "sleep 10"
+  assert_output "AI SRE setup complete!"
+
+  start_case audience_retry_gives_up
+  audience_response 503 '{"error": "Service unavailable"}'
+  run_setup --ai-sre "$TOKEN"
+  assert_status 1
+  assert_call_count "curl GET" 8
+  assert_output "Could not fetch the integration's details from Better Stack (HTTP 503: Service unavailable)"
+  refute_call "gcloud"
+}
+
+test_api_url_must_be_https() {
+  start_case api_url_http
+  run_setup --ai-sre "$TOKEN" --api-url http://example.test
+  assert_status 1
+  assert_output "--api-url must be an https URL."
+  refute_call "curl"
+}
+
+test_audience_charset() {
+  local bad
+  for bad in "https://betterstack.com/ai-sre/gcp/x'y" "https://betterstack.com/a b" "http://betterstack.com/ai-sre/gcp/1" "https://betterstack.com/ai-sre/gcp/1?a=b"; do
+    start_case audience_charset
+    audience_response 200 "{\"audience\": \"$bad\", \"caller_service_account\": \"$CALLER\", \"pool_project_id\": null}"
+    run_setup --ai-sre "$TOKEN"
+    assert_status 1
+    assert_output "unexpected audience"
+    refute_call "gcloud"
+  done
+}
+
+test_teardown_keeps_pool_with_ai_sre_provider() {
+  start_case teardown_shared_pool
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider" "$MOCK/state/provider-betterstack-ai-sre"
+  run_setup_answering y --teardown --project=pool-proj --region=europe-west1 --ingesting-host=s1.example.com
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools providers delete betterstack-provider --workload-identity-pool=betterstack-pool --location=global --project=pool-proj --quiet"
+  refute_call "gcloud iam workload-identity-pools delete betterstack-pool"
+  refute_call "providers delete betterstack-ai-sre"
+  refute_call "betterstack-ai-sre@"
+  assert_output "Keeping WIF pool betterstack-pool: it also holds the betterstack-ai-sre provider"
+  assert_call "gcloud iam service-accounts delete betterstack-integration@pool-proj.iam.gserviceaccount.com"
+  assert_output "Teardown complete."
+}
+
+test_teardown_without_ai_sre_deletes_pool() {
+  start_case teardown_pool
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider"
+  run_setup_answering y --teardown --project=pool-proj --region=europe-west1 --ingesting-host=s1.example.com
+  assert_status 0
+  assert_output "Deleting WIF pool (cascades providers)..."
+  assert_call "gcloud iam workload-identity-pools delete betterstack-pool --location=global --project=pool-proj --quiet"
+  refute_call "providers delete"
+  refute_output "Keeping WIF pool"
+  assert_output "Teardown complete."
 }
 
 test_ingestion_mode_still_works() {
