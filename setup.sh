@@ -18,6 +18,14 @@ ORG_ID=""
 TEARDOWN=false
 SKIP_LOG_FORWARDING=false
 
+# --- AI SRE mode defaults ---
+AI_SRE=false
+AI_SRE_TOKEN=""
+AI_SRE_SERVICES=""
+AI_SRE_AUDIT_LOGS=false
+AI_SRE_API_URL="https://telemetry.betterstack.com"
+DRY_RUN=false
+
 # --- Supported Dataflow regions ---
 DATAFLOW_REGIONS=(
   asia-east1 asia-east2 asia-northeast1 asia-northeast2 asia-northeast3
@@ -40,7 +48,10 @@ Better Stack GCP Integration Setup
 Usage:
   $(basename "$0") --project=<id> --region=<region> --source-token=<token> --ingesting-host=<host> [options]
   $(basename "$0") --teardown --project=<id> --region=<region> --ingesting-host=<host> [--org-id=<id>]
+  $(basename "$0") --ai-sre <token> [--project <id>] [AI SRE options]
   $(basename "$0") --help
+
+Log and metrics ingestion
 
 Required:
   --project=<id>             GCP project ID
@@ -55,6 +66,21 @@ Optional:
   --skip-log-forwarding      Skip Pub/Sub, log sink, and Dataflow setup (metrics access only)
   --teardown                 Remove all integration resources for the project (and org sink, if --org-id given)
   --help, -h                 Show this help and exit
+
+AI SRE (read-only access for Better Stack AI SRE)
+
+  --ai-sre <token>           Registration token from the GCP integration in Better Stack
+  --project <id>             Project to connect (default: the current gcloud project).
+                             The first project also holds the identity pool and the
+                             service account. To add another project to the same
+                             integration, use a new token and pass --project.
+  --services <list>          Optional servers, comma-separated, possibly in Preview:
+                             cloudtrace, clouderrorreporting, container
+  --audit-logs               Turn on Data Access audit logs (DATA_READ) for
+                             mcp.googleapis.com. Off by default: they are billed
+                             as Cloud Logging ingestion.
+  --api-url <url>            Better Stack API base URL (default: ${AI_SRE_API_URL})
+  --dry-run                  Print every gcloud and curl call without running any
 EOF
 }
 
@@ -63,6 +89,538 @@ print_regions() {
   for r in "${DATAFLOW_REGIONS[@]}"; do
     echo "  $r"
   done
+}
+
+# --- AI SRE mode (--ai-sre) ---
+#
+# Gives Better Stack AI SRE read-only access to GCP projects through Google's
+# MCP servers. In the first project it creates (or reuses) the betterstack-pool
+# workload identity pool, adds a betterstack-ai-sre provider that accepts only
+# Better Stack's AI SRE caller and this integration's audience, and creates a
+# read-only betterstack-ai-sre service account. Every further project only
+# grants that service account its roles. Each project is then registered with
+# Better Stack using the one-time token from the integration's page.
+#
+# Every step checks what exists first, so running the same command again after
+# a failure completes the setup.
+
+AI_SRE_CALLER="ai-sre-caller@better-stack.iam.gserviceaccount.com"
+AI_SRE_POOL="betterstack-pool"
+AI_SRE_PROVIDER="betterstack-ai-sre"
+AI_SRE_SA_NAME="betterstack-ai-sre"
+AI_SRE_ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser)
+AI_SRE_APIS=(logging monitoring run cloudresourcemanager)
+AI_SRE_POOL_APIS=(iam iamcredentials sts)
+AI_SRE_OPTIONAL_SERVICES="cloudtrace clouderrorreporting container"
+AI_SRE_REGISTER_TIMEOUT=180
+AI_SRE_OUT=""
+AI_SRE_STATUS=""
+
+ai_sre_service_role() {
+  case "$1" in
+    cloudtrace) echo "roles/cloudtrace.user" ;;
+    clouderrorreporting) echo "roles/errorreporting.viewer" ;;
+    container) echo "roles/container.clusterViewer" ;;
+    *) return 1 ;;
+  esac
+}
+
+ai_sre_error() {
+  echo ""
+  echo "Error: $*"
+  exit 1
+}
+
+# Prints a command the way a shell would read it back.
+ai_sre_show() {
+  local line="  $" arg q="'"
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+      line+=" $arg"
+    else
+      line+=" ${q}${arg//${q}/${q}\\${q}${q}}${q}"
+    fi
+  done
+  echo "$line"
+}
+
+ai_sre_rerun_hint() {
+  echo ""
+  echo "Fix the problem above, then run the same command again: the script picks up where it stopped."
+}
+
+# Explains a failed gcloud call and exits.
+ai_sre_gcloud_failed() {
+  local what="$1" role="$2" out="$3" permission line
+  echo ""
+  if grep -q "FAILED_PRECONDITION" <<<"$out" && grep -q "iam.workloadIdentityPoolProviders" <<<"$out"; then
+    echo "Error: ${what} failed: an organization policy blocks it."
+    echo "  constraints/iam.workloadIdentityPoolProviders does not allow https://accounts.google.com"
+    echo "  as an identity provider. Allow it for project ${AI_SRE_POOL_PROJECT} with the command below"
+    echo "  (needs roles/orgpolicy.policyAdmin), then run this script again:"
+    echo ""
+    echo "    gcloud resource-manager org-policies allow constraints/iam.workloadIdentityPoolProviders https://accounts.google.com --project=${AI_SRE_POOL_PROJECT}"
+  elif grep -qiE "PERMISSION_DENIED|does not have permission|Permission '[^']+' denied" <<<"$out"; then
+    permission=$(grep -oE "Permission '[^']+'" <<<"$out" | head -n 1 | sed -E "s/Permission '([^']+)'/\1/" || true)
+    echo "Error: ${what} failed: permission denied."
+    [ -n "$permission" ] && echo "  Missing permission: ${permission}"
+    echo "  The account running this script needs ${role}."
+    echo "  roles/owner includes it."
+  else
+    echo "Error: ${what} failed."
+  fi
+  echo ""
+  echo "  gcloud said:"
+  while IFS= read -r line; do
+    echo "    $line"
+  done <<<"$out"
+  ai_sre_rerun_hint
+  exit 1
+}
+
+# ai_sre_gcloud <what> <role needed> <gcloud args...>
+# Runs gcloud with its output in AI_SRE_OUT, and exits with an explanation if it fails.
+ai_sre_gcloud() {
+  local what="$1" role="$2" attempt status
+  shift 2
+  if [ "$DRY_RUN" = true ]; then
+    ai_sre_show gcloud "$@"
+    AI_SRE_OUT=""
+    return 0
+  fi
+  for attempt in 1 2 3 4 5 6; do
+    status=0
+    AI_SRE_OUT=$(gcloud "$@" 2>"$AI_SRE_TMP/gcloud.err") || status=$?
+    [ "$status" -eq 0 ] && return 0
+    # A service account created a moment ago can take a few seconds to reach IAM.
+    if [ "$attempt" -lt 6 ] && grep -qiE "service ?account .*does not exist" "$AI_SRE_TMP/gcloud.err"; then
+      sleep 5
+      continue
+    fi
+    break
+  done
+  ai_sre_gcloud_failed "$what" "$role" "$(cat "$AI_SRE_TMP/gcloud.err")${AI_SRE_OUT:+$'\n'$AI_SRE_OUT}"
+}
+
+# ai_sre_probe <gcloud args...>
+# Runs a read-only describe call. AI_SRE_OUT holds its output, or nothing if it failed.
+ai_sre_probe() {
+  if [ "$DRY_RUN" = true ]; then
+    ai_sre_show gcloud "$@"
+    AI_SRE_OUT=""
+    return 0
+  fi
+  AI_SRE_OUT=$(gcloud "$@" 2>/dev/null) || AI_SRE_OUT=""
+}
+
+# ai_sre_api <method> <path> [json body]
+# Calls the Better Stack API. AI_SRE_STATUS holds the HTTP status (000 if no
+# answer), and the body is in $AI_SRE_TMP/body.json.
+ai_sre_api() {
+  local method="$1" path="$2" data="${3:-}"
+  local url="${AI_SRE_API_URL}${path}"
+  local args=(-sS -X "$method" -H "Accept: application/json" --connect-timeout 10 --max-time 60)
+  if [ -n "$data" ]; then
+    args+=(-H "Content-Type: application/json" --data "$data")
+  fi
+  if [ "$DRY_RUN" = true ]; then
+    ai_sre_show curl "${args[@]}" -H "Authorization: Bearer <token>" "$url"
+    AI_SRE_STATUS="dry-run"
+    return 0
+  fi
+  : >"$AI_SRE_TMP/body.json"
+  # The token is read from a file so it never shows in the process list.
+  AI_SRE_STATUS=$(curl "${args[@]}" -H @"$AI_SRE_TMP/auth-header" \
+    -o "$AI_SRE_TMP/body.json" -w '%{http_code}' "$url" 2>"$AI_SRE_TMP/curl.err") || AI_SRE_STATUS="000"
+}
+
+# ai_sre_json <field>: prints a field of the last API answer ("" when absent or null).
+ai_sre_json() {
+  python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[2])).get(sys.argv[1])
+except Exception:
+    value = None
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, list):
+    print(", ".join(str(v) for v in value))
+else:
+    print(value)
+' "$1" "$AI_SRE_TMP/body.json"
+}
+
+# Describes the last failed API answer.
+ai_sre_api_error() {
+  local message
+  if [ "$AI_SRE_STATUS" = "000" ]; then
+    message=$(cat "$AI_SRE_TMP/curl.err")
+    echo "could not reach ${AI_SRE_API_URL}${message:+: ${message}}"
+    return
+  fi
+  message=$(ai_sre_json error)
+  echo "HTTP ${AI_SRE_STATUS}${message:+: ${message}}"
+}
+
+ai_sre_token_rejected() {
+  echo ""
+  echo "Error: Better Stack rejected the registration token ($(ai_sre_api_error))."
+  echo "  Tokens are valid for 24 hours and work once. Get a new command from the"
+  echo "  GCP integration in Better Stack and run it again."
+  exit 1
+}
+
+ai_sre_fetch_audience() {
+  echo "Fetching the integration's details from Better Stack..."
+  ai_sre_api GET /api/v1/ai-sre/gcp-registrations/audience
+  if [ "$DRY_RUN" = true ]; then
+    AI_SRE_AUDIENCE="AUDIENCE_FROM_BETTER_STACK"
+    AI_SRE_KNOWN_POOL_PROJECT=""
+    AI_SRE_KNOWN_POOL_NUMBER=""
+    AI_SRE_KNOWN_SA=""
+    echo "  Dry run: assuming the integration has no project yet."
+    echo ""
+    return 0
+  fi
+  case "$AI_SRE_STATUS" in
+    200) ;;
+    401) ai_sre_token_rejected ;;
+    *) ai_sre_error "Could not fetch the integration's details from Better Stack ($(ai_sre_api_error))." ;;
+  esac
+
+  AI_SRE_AUDIENCE=$(ai_sre_json audience)
+  AI_SRE_KNOWN_POOL_PROJECT=$(ai_sre_json pool_project_id)
+  AI_SRE_KNOWN_POOL_NUMBER=$(ai_sre_json pool_project_number)
+  AI_SRE_KNOWN_SA=$(ai_sre_json service_account_email)
+  local caller
+  caller=$(ai_sre_json caller_service_account)
+
+  # The audience becomes the provider's only allowed audience: one https URL, no commas.
+  if ! [[ "$AI_SRE_AUDIENCE" =~ ^https://[A-Za-z0-9._~:/?#@!\$\&\'\(\)*+\;=%-]+$ ]] || [[ "$AI_SRE_AUDIENCE" == *,* ]]; then
+    ai_sre_error "Better Stack returned an unexpected audience: '${AI_SRE_AUDIENCE}'."
+  fi
+  if [ -n "$caller" ] && [ "$caller" != "$AI_SRE_CALLER" ]; then
+    ai_sre_error "Better Stack names '${caller}' as its AI SRE caller, but this script trusts only ${AI_SRE_CALLER}. Use the latest version of this script."
+  fi
+  if [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ]; then
+    if [ "$AI_SRE_KNOWN_SA" != "${AI_SRE_SA_NAME}@${AI_SRE_KNOWN_POOL_PROJECT}.iam.gserviceaccount.com" ] \
+      || ! [[ "$AI_SRE_KNOWN_POOL_NUMBER" =~ ^[0-9]+$ ]]; then
+      ai_sre_error "Better Stack returned an unexpected project or service account for this integration."
+    fi
+  fi
+  echo "  Audience: $AI_SRE_AUDIENCE"
+  [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ] && echo "  Already connected: $(ai_sre_json project_ids) (identity pool in ${AI_SRE_KNOWN_POOL_PROJECT})"
+  echo ""
+}
+
+ai_sre_project_number() {
+  echo "Reading project ${AI_SRE_PROJECT}..."
+  ai_sre_gcloud "Reading project ${AI_SRE_PROJECT}" "roles/browser on project ${AI_SRE_PROJECT}" \
+    projects describe "$AI_SRE_PROJECT" --format='value(projectNumber)'
+  if [ "$DRY_RUN" = true ]; then
+    AI_SRE_PROJECT_NUMBER="PROJECT_NUMBER"
+    return 0
+  fi
+  AI_SRE_PROJECT_NUMBER=$(tr -d '[:space:]' <<<"$AI_SRE_OUT")
+  [[ "$AI_SRE_PROJECT_NUMBER" =~ ^[0-9]+$ ]] || ai_sre_error "Could not read the project number of ${AI_SRE_PROJECT}."
+}
+
+ai_sre_enable_apis() {
+  local apis=("$@") services=() api
+  for api in "${apis[@]}"; do
+    services+=("${api}.googleapis.com")
+  done
+  echo "Enabling APIs in ${AI_SRE_PROJECT}: ${apis[*]}..."
+  ai_sre_gcloud "Enabling APIs" "roles/serviceusage.serviceUsageAdmin on project ${AI_SRE_PROJECT}" \
+    services enable "${services[@]}" --project="$AI_SRE_PROJECT" --quiet
+}
+
+ai_sre_ensure_pool() {
+  local role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
+  echo "Setting up workload identity pool ${AI_SRE_POOL}..."
+  ai_sre_probe iam workload-identity-pools describe "$AI_SRE_POOL" \
+    --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+  case "$AI_SRE_OUT" in
+    ACTIVE) echo "  Reusing existing pool." ;;
+    DELETED)
+      ai_sre_gcloud "Restoring pool ${AI_SRE_POOL}" "$role" \
+        iam workload-identity-pools undelete "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
+      ;;
+    *)
+      ai_sre_gcloud "Creating pool ${AI_SRE_POOL}" "$role" \
+        iam workload-identity-pools create "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" \
+        --display-name="Better Stack Integration"
+      ;;
+  esac
+}
+
+ai_sre_ensure_provider() {
+  local role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
+  local args=(
+    --workload-identity-pool="$AI_SRE_POOL"
+    --location=global --project="$AI_SRE_PROJECT"
+    --issuer-uri="https://accounts.google.com"
+    --allowed-audiences="$AI_SRE_AUDIENCE"
+    --attribute-mapping="google.subject=assertion.sub,attribute.sa_email=assertion.email"
+    --attribute-condition="assertion.email=='${AI_SRE_CALLER}'"
+  )
+  echo "Setting up identity provider ${AI_SRE_PROVIDER} (accepts only ${AI_SRE_CALLER})..."
+  ai_sre_probe iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
+    --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+  if [ "$AI_SRE_OUT" = "DELETED" ]; then
+    ai_sre_gcloud "Restoring provider ${AI_SRE_PROVIDER}" "$role" \
+      iam workload-identity-pools providers undelete "$AI_SRE_PROVIDER" \
+      --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
+    AI_SRE_OUT="ACTIVE"
+  fi
+  if [ "$AI_SRE_OUT" = "ACTIVE" ]; then
+    ai_sre_gcloud "Updating provider ${AI_SRE_PROVIDER}" "$role" \
+      iam workload-identity-pools providers update-oidc "$AI_SRE_PROVIDER" "${args[@]}"
+  else
+    ai_sre_gcloud "Creating provider ${AI_SRE_PROVIDER}" "$role" \
+      iam workload-identity-pools providers create-oidc "$AI_SRE_PROVIDER" "${args[@]}" \
+      --display-name="Better Stack AI SRE"
+  fi
+}
+
+ai_sre_ensure_service_account() {
+  echo "Setting up service account ${AI_SRE_SA}..."
+  ai_sre_probe iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
+  if [ -n "$AI_SRE_OUT" ]; then
+    echo "  Reusing existing service account."
+    return 0
+  fi
+  ai_sre_gcloud "Creating service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+    iam service-accounts create "$AI_SRE_SA_NAME" --project="$AI_SRE_PROJECT" \
+    --display-name="Better Stack AI SRE" --description="Read-only access for Better Stack AI SRE"
+}
+
+ai_sre_grant_roles() {
+  local role
+  echo "Granting read-only roles to ${AI_SRE_SA} on ${AI_SRE_PROJECT}..."
+  for role in "${AI_SRE_ROLES_TO_GRANT[@]}"; do
+    echo "  $role"
+    ai_sre_gcloud "Granting ${role}" "roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}" \
+      projects add-iam-policy-binding "$AI_SRE_PROJECT" \
+      --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet
+  done
+}
+
+ai_sre_allow_impersonation() {
+  local member="principalSet://iam.googleapis.com/projects/${AI_SRE_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${AI_SRE_POOL}/attribute.sa_email/${AI_SRE_CALLER}"
+  echo "Letting ${AI_SRE_CALLER} impersonate ${AI_SRE_SA} through ${AI_SRE_PROVIDER}..."
+  ai_sre_gcloud "Granting roles/iam.workloadIdentityUser on ${AI_SRE_SA}" \
+    "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+    iam service-accounts add-iam-policy-binding "$AI_SRE_SA" --project="$AI_SRE_PROJECT" \
+    --member="$member" --role="roles/iam.workloadIdentityUser" --condition=None --quiet
+}
+
+ai_sre_enable_audit_logs() {
+  local role="roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}"
+  local policy_file="$AI_SRE_TMP/policy.json" changed
+  echo "Turning on Data Access audit logs (DATA_READ) for mcp.googleapis.com in ${AI_SRE_PROJECT}..."
+  ai_sre_gcloud "Reading the IAM policy of ${AI_SRE_PROJECT}" "$role" \
+    projects get-iam-policy "$AI_SRE_PROJECT" --format=json
+  if [ "$DRY_RUN" = true ]; then
+    ai_sre_show gcloud projects set-iam-policy "$AI_SRE_PROJECT" "POLICY_WITH_MCP_DATA_READ.json" --quiet
+    return 0
+  fi
+  changed=$(python3 -c '
+import json, sys
+policy = json.loads(sys.argv[1])
+configs = policy.setdefault("auditConfigs", [])
+config = next((c for c in configs if c.get("service") == "mcp.googleapis.com"), None)
+if config is None:
+    config = {"service": "mcp.googleapis.com", "auditLogConfigs": []}
+    configs.append(config)
+logs = config.setdefault("auditLogConfigs", [])
+if any(l.get("logType") == "DATA_READ" for l in logs):
+    print("no")
+else:
+    logs.append({"logType": "DATA_READ"})
+    json.dump(policy, open(sys.argv[2], "w"))
+    print("yes")
+' "$AI_SRE_OUT" "$policy_file") || ai_sre_error "Could not read the IAM policy of ${AI_SRE_PROJECT}."
+  if [ "$changed" = "no" ]; then
+    echo "  Already on."
+    return 0
+  fi
+  ai_sre_gcloud "Turning on audit logs" "$role" \
+    projects set-iam-policy "$AI_SRE_PROJECT" "$policy_file" --quiet
+}
+
+ai_sre_register() {
+  local body waited=0 delay=5 retryable
+  body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3]}))' \
+    "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA")
+  echo "Registering ${AI_SRE_PROJECT} with Better Stack..."
+  while true; do
+    ai_sre_api POST /api/v1/ai-sre/gcp-registrations "$body"
+    case "$AI_SRE_STATUS" in
+      dry-run) return 0 ;;
+      200|201) return 0 ;;
+      401) ai_sre_token_rejected ;;
+      422)
+        retryable=$(ai_sre_json retryable)
+        if [ "$retryable" != "true" ]; then
+          echo ""
+          echo "Error: Better Stack refused the registration ($(ai_sre_api_error))."
+          exit 1
+        fi
+        ;;
+      429|5??|000) ;;
+      *)
+        echo ""
+        echo "Error: Registration failed ($(ai_sre_api_error))."
+        ai_sre_rerun_hint
+        exit 1
+        ;;
+    esac
+    if [ $((waited + delay)) -gt "$AI_SRE_REGISTER_TIMEOUT" ]; then
+      echo ""
+      echo "Error: Better Stack could not use the new access after ${waited} seconds ($(ai_sre_api_error))."
+      echo "  Google can take several minutes to apply IAM changes."
+      ai_sre_rerun_hint
+      exit 1
+    fi
+    echo "  Not ready yet ($(ai_sre_api_error)). Google can take a few minutes to apply IAM changes; retrying in ${delay}s..."
+    sleep "$delay"
+    waited=$((waited + delay))
+    delay=$((delay * 2))
+    [ "$delay" -gt 30 ] && delay=30
+  done
+}
+
+ai_sre_main() {
+  local service api
+
+  if [ -z "$AI_SRE_TOKEN" ] || [[ "$AI_SRE_TOKEN" == -* ]]; then
+    ai_sre_error "--ai-sre needs the registration token shown on the GCP integration in Better Stack."
+  fi
+  if ! [[ "$AI_SRE_TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    ai_sre_error "The registration token has unexpected characters. Copy the command from Better Stack again."
+  fi
+  if [ "$TEARDOWN" = true ] || [ "$SKIP_LOG_FORWARDING" = true ] || [ -n "$ORG_ID" ] || [ -n "$REGION" ] \
+    || [ -n "${SOURCE_TOKEN:-}" ] || [ -n "${INGESTING_HOST:-}" ]; then
+    ai_sre_error "--ai-sre can't be combined with the ingestion options (--teardown, --org-id, --region, --source-token, --ingesting-host, --skip-log-forwarding)."
+  fi
+  AI_SRE_API_URL="${AI_SRE_API_URL%/}"
+  [[ "$AI_SRE_API_URL" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || ai_sre_error "--api-url must be an http(s) URL."
+
+  AI_SRE_ROLES_TO_GRANT=("${AI_SRE_ROLES[@]}")
+  AI_SRE_APIS_TO_ENABLE=("${AI_SRE_APIS[@]}")
+  if [ -n "$AI_SRE_SERVICES" ]; then
+    local requested=()
+    IFS=',' read -r -a requested <<<"$AI_SRE_SERVICES"
+    for service in "${requested[@]}"; do
+      service=$(tr -d '[:space:]' <<<"$service")
+      [ -z "$service" ] && continue
+      if ! ai_sre_service_role "$service" >/dev/null; then
+        ai_sre_error "Unknown service '${service}' in --services. Choose from: ${AI_SRE_OPTIONAL_SERVICES// /, }."
+      fi
+      # Skip duplicates.
+      for api in "${AI_SRE_APIS_TO_ENABLE[@]}"; do
+        [ "$api" = "$service" ] && continue 2
+      done
+      AI_SRE_ROLES_TO_GRANT+=("$(ai_sre_service_role "$service")")
+      AI_SRE_APIS_TO_ENABLE+=("$service")
+    done
+  fi
+
+  command -v python3 >/dev/null || ai_sre_error "python3 is required."
+  if [ "$DRY_RUN" = false ]; then
+    command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
+    command -v curl >/dev/null || ai_sre_error "curl is required."
+  fi
+
+  AI_SRE_TMP=$(mktemp -d)
+  # shellcheck disable=SC2064 # expand the path now
+  trap "rm -rf '$AI_SRE_TMP'" EXIT
+  printf 'Authorization: Bearer %s\n' "$AI_SRE_TOKEN" >"$AI_SRE_TMP/auth-header"
+
+  echo "Better Stack AI SRE Setup"
+  echo "========================="
+  echo ""
+  if [ "$DRY_RUN" = true ]; then
+    echo "Dry run: printing every gcloud and curl call without running any."
+    echo ""
+  fi
+
+  ai_sre_fetch_audience
+
+  AI_SRE_PROJECT="${PROJECT:-}"
+  if [ -z "$AI_SRE_PROJECT" ]; then
+    if [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ]; then
+      ai_sre_error "This integration is already connected to ${AI_SRE_KNOWN_POOL_PROJECT}. To add another project, run the command again with --project <id>."
+    fi
+    if [ "$DRY_RUN" = true ]; then
+      ai_sre_show gcloud config get-value project
+      AI_SRE_PROJECT="CURRENT_GCLOUD_PROJECT"
+    else
+      AI_SRE_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
+      [ -n "$AI_SRE_PROJECT" ] || ai_sre_error "No project given and no current gcloud project. Pass --project <id>."
+    fi
+  fi
+  [[ "$AI_SRE_PROJECT" =~ ^[a-z0-9.:-]+$ ]] || ai_sre_error "'${AI_SRE_PROJECT}' is not a valid project ID."
+
+  if [ -z "$AI_SRE_KNOWN_POOL_PROJECT" ] || [ "$AI_SRE_KNOWN_POOL_PROJECT" = "$AI_SRE_PROJECT" ]; then
+    AI_SRE_MODE="pool"
+    AI_SRE_POOL_PROJECT="$AI_SRE_PROJECT"
+  else
+    AI_SRE_MODE="added"
+    AI_SRE_POOL_PROJECT="$AI_SRE_KNOWN_POOL_PROJECT"
+  fi
+  AI_SRE_SA="${AI_SRE_SA_NAME}@${AI_SRE_POOL_PROJECT}.iam.gserviceaccount.com"
+
+  echo "  Project:          $AI_SRE_PROJECT"
+  if [ "$AI_SRE_MODE" = "pool" ]; then
+    echo "  Setup:            identity pool, provider and service account in this project"
+  else
+    echo "  Setup:            roles for the existing service account (identity pool in ${AI_SRE_POOL_PROJECT})"
+  fi
+  echo "  Service account:  $AI_SRE_SA"
+  echo "  Servers:          ${AI_SRE_APIS_TO_ENABLE[*]}"
+  echo "  Audit logs:       $([ "$AI_SRE_AUDIT_LOGS" = true ] && echo "on (DATA_READ for mcp.googleapis.com)" || echo "not changed (--audit-logs turns them on)")"
+  echo ""
+
+  ai_sre_project_number
+  if [ "$AI_SRE_MODE" = "pool" ] && [ -n "$AI_SRE_KNOWN_POOL_NUMBER" ] && [ "$AI_SRE_KNOWN_POOL_NUMBER" != "$AI_SRE_PROJECT_NUMBER" ]; then
+    ai_sre_error "Project ${AI_SRE_PROJECT} now has number ${AI_SRE_PROJECT_NUMBER}, but Better Stack registered ${AI_SRE_KNOWN_POOL_NUMBER}."
+  fi
+
+  if [ "$AI_SRE_MODE" = "pool" ]; then
+    ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS_TO_ENABLE[@]}"
+    ai_sre_ensure_pool
+    ai_sre_ensure_provider
+    ai_sre_ensure_service_account
+    ai_sre_grant_roles
+    ai_sre_allow_impersonation
+  else
+    ai_sre_enable_apis "${AI_SRE_APIS_TO_ENABLE[@]}"
+    ai_sre_grant_roles
+  fi
+  [ "$AI_SRE_AUDIT_LOGS" = true ] && ai_sre_enable_audit_logs
+
+  ai_sre_register
+
+  echo ""
+  if [ "$DRY_RUN" = true ]; then
+    echo "Dry run complete: nothing was changed."
+    return 0
+  fi
+  echo "==================================="
+  echo "AI SRE setup complete!"
+  echo "==================================="
+  echo ""
+  echo "  Project:            $AI_SRE_PROJECT"
+  echo "  Service account:    $AI_SRE_SA"
+  echo "  Connected projects: $(ai_sre_json project_ids)"
+  echo ""
+  echo "The integration is now active in Better Stack. To connect another project,"
+  echo "use \"Add project\" on the integration and run the command it shows."
 }
 
 # --- Parse arguments ---
@@ -85,9 +643,28 @@ while [ $# -gt 0 ]; do
     --batch-count) BATCH_COUNT="$2"; shift 2 ;;
     --skip-log-forwarding) SKIP_LOG_FORWARDING=true; shift ;;
     --teardown) TEARDOWN=true; shift ;;
+    --ai-sre=*) AI_SRE=true; AI_SRE_TOKEN="${1#*=}"; shift ;;
+    --ai-sre) AI_SRE=true; AI_SRE_TOKEN="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --services=*) AI_SRE_SERVICES="${1#*=}"; shift ;;
+    --services) AI_SRE_SERVICES="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
+    --api-url) AI_SRE_API_URL="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown argument: $1"; echo "Run with --help for usage."; exit 1 ;;
   esac
 done
+
+# --- AI SRE mode ---
+if [ "$AI_SRE" = true ]; then
+  ai_sre_main
+  exit 0
+fi
+if [ "$DRY_RUN" = true ] || [ "$AI_SRE_AUDIT_LOGS" = true ] || [ -n "$AI_SRE_SERVICES" ] \
+  || [ "$AI_SRE_API_URL" != "https://telemetry.betterstack.com" ]; then
+  echo "Error: --services, --audit-logs, --api-url and --dry-run are only available with --ai-sre."
+  exit 1
+fi
 
 # --- Validate region (required for both setup and teardown) ---
 if [ -z "$REGION" ]; then

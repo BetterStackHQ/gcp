@@ -59,6 +59,63 @@ The fastest way to deploy. Requires the [gcloud CLI](https://cloud.google.com/sd
   --org-id=123456789
 ```
 
+## AI SRE
+
+`--ai-sre` gives [Better Stack AI SRE](https://betterstack.com) read-only access to your projects through Google's MCP servers. Create a GCP integration in Better Stack, then run the command it shows, for example in Cloud Shell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- --ai-sre YOUR_TOKEN
+```
+
+The token is valid for 24 hours and works once. The first project defaults to the current `gcloud` project; pass `--project <id>` to choose another. To connect a further project, use **Add project** on the integration and run its command, which adds `--project <id>`.
+
+### What gets created
+
+In the first project:
+
+- **Workload identity pool** `betterstack-pool`, reused if the ingestion setup already created it.
+- **Identity provider** `betterstack-ai-sre` in that pool. It trusts Google-signed ID tokens (`https://accounts.google.com`) only from `ai-sre-caller@better-stack.iam.gserviceaccount.com`, and only with the audience generated for your integration. The ingestion provider is left as it is.
+- **Service account** `betterstack-ai-sre@<project>.iam.gserviceaccount.com`, which Better Stack impersonates through that provider (`roles/iam.workloadIdentityUser`). No keys are created.
+
+In every connected project, the service account gets read-only roles and the APIs behind each MCP server are enabled:
+
+| Server | Roles | API |
+|--------|-------|-----|
+| Required | `roles/mcp.toolUser` | |
+| Cloud Logging | `roles/logging.viewer` | `logging.googleapis.com` |
+| Cloud Monitoring | `roles/monitoring.viewer` | `monitoring.googleapis.com` |
+| Cloud Run | `roles/run.viewer` | `run.googleapis.com` |
+| Resource Manager | `roles/browser` | `cloudresourcemanager.googleapis.com` |
+| Cloud Trace (`--services cloudtrace`) | `roles/cloudtrace.user` | `cloudtrace.googleapis.com` |
+| Error Reporting (`--services clouderrorreporting`) | `roles/errorreporting.viewer` | `clouderrorreporting.googleapis.com` |
+| Kubernetes Engine (`--services container`) | `roles/container.clusterViewer` | `container.googleapis.com` |
+
+The first project also enables `iam`, `iamcredentials` and `sts`. The script then registers the project with Better Stack, which checks that it can list the MCP tools before the integration turns active. New IAM grants can take a few minutes to apply, so the script retries for up to 3 minutes.
+
+### Options
+
+| Argument | Description |
+|----------|-------------|
+| `--ai-sre <token>` | Registration token from the GCP integration in Better Stack |
+| `--project <id>` | Project to connect (default: the current `gcloud` project) |
+| `--services <list>` | Optional servers, comma-separated: `cloudtrace`, `clouderrorreporting`, `container`. These may still be in Preview at Google. |
+| `--audit-logs` | Turns on Data Access audit logs (`DATA_READ` for `mcp.googleapis.com`), so every MCP call is logged in your project. Off by default: they are billed as Cloud Logging ingestion. |
+| `--api-url <url>` | Better Stack API base URL (default: `https://telemetry.betterstack.com`) |
+| `--dry-run` | Prints every `gcloud` and `curl` call without running any. It assumes a first run, with placeholders for the audience and the project number. |
+
+### Permissions and errors
+
+The user running the script needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` (only the last two in further projects). When a step is denied, the script names the missing permission and the role that grants it.
+
+If your organization restricts identity providers with `constraints/iam.workloadIdentityPoolProviders`, creating the provider fails and the script prints the command that allows `https://accounts.google.com`, which needs `roles/orgpolicy.policyAdmin`:
+
+```bash
+gcloud resource-manager org-policies allow constraints/iam.workloadIdentityPoolProviders \
+  https://accounts.google.com --project=my-project
+```
+
+Every step checks what already exists, so after any failure, fix the cause and run the same command again.
+
 ## Terraform
 
 See the [Terraform module README](terraform/README.md) for full usage and variable reference.
@@ -87,6 +144,15 @@ The user running the setup needs:
 
 - **Project-level**: `roles/owner` or `roles/editor` on the GCP project
 - **Org-level** (only if deploying with `--org-id`): `roles/resourcemanager.organizationAdmin` on the organization
+
+## Tests
+
+`test/setup_test.sh` runs `setup.sh` against mocked `gcloud` and `curl` commands, so it needs no GCP project or Better Stack account (only `bash` and `python3`):
+
+```bash
+test/setup_test.sh
+shellcheck setup.sh test/setup_test.sh
+```
 
 ## Log Filter Management
 
