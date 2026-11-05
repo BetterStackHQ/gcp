@@ -59,11 +59,24 @@ case "$ARGS" in
     ;;
   "iam workload-identity-pools create "*) echo ACTIVE >"$S/pool" ;;
   "iam workload-identity-pools undelete "*) echo ACTIVE >"$S/pool" ;;
+  # A deleted provider stays describable in state DELETED, as at Google (for 30 days).
   "iam workload-identity-pools providers describe "*)
     [ -f "$S/provider-$5" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
-    echo ACTIVE
+    state=ACTIVE
+    [ "$(cat "$S/provider-$5")" = DELETED ] && state=DELETED
+    if [[ "$ARGS" == *--format=* ]]; then echo "$state"; else printf 'name: %s\nstate: %s\n' "$5" "$state"; fi
     ;;
-  "iam workload-identity-pools providers create-oidc "*|"iam workload-identity-pools providers update-oidc "*)
+  "iam workload-identity-pools providers delete "*) echo DELETED >"$S/provider-$5" ;;
+  "iam workload-identity-pools providers undelete "*) echo ACTIVE >"$S/provider-$5" ;;
+  "iam workload-identity-pools providers update-oidc "*)
+    if [ "$(cat "$S/provider-$5" 2>/dev/null)" = DELETED ]; then
+      echo "ERROR: (gcloud.iam.workload-identity-pools.providers.update-oidc) FAILED_PRECONDITION: The provider is deleted." >&2
+      exit 1
+    fi
+    echo "$ARGS" >"$S/provider-$5"
+    ;;
+  "iam workload-identity-pools providers create-oidc "*)
+    [ -f "$S/provider-$5" ] && { echo "ERROR: ALREADY_EXISTS" >&2; exit 1; }
     echo "$ARGS" >"$S/provider-$5"
     ;;
   "iam service-accounts describe "*)
@@ -665,6 +678,23 @@ test_teardown_without_ai_sre_deletes_pool() {
   refute_call "providers delete"
   refute_output "Keeping WIF pool"
   assert_output "Teardown complete."
+}
+
+test_ingestion_setup_after_teardown_restores_provider() {
+  start_case reinstall_after_teardown
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider" "$MOCK/state/provider-betterstack-ai-sre"
+  run_setup_answering y --teardown --project=pool-proj --region=europe-west1 --ingesting-host=s1.example.com
+  assert_status 0
+  check "teardown did not delete the ingestion provider" grep -qx DELETED "$MOCK/state/provider-betterstack-provider"
+
+  run_setup --project=pool-proj --region=europe-west1 --source-token=src-token --ingesting-host=s1.example.com --skip-log-forwarding
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools providers undelete betterstack-provider --workload-identity-pool=betterstack-pool --location=global --project=pool-proj"
+  assert_call "providers update-oidc betterstack-provider"
+  refute_call "betterstack-ai-sre"
+  check "the ingestion provider is not active again" grep -q "update-oidc betterstack-provider" "$MOCK/state/provider-betterstack-provider"
+  assert_output "Setup complete!"
 }
 
 test_ingestion_mode_still_works() {

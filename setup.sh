@@ -1100,8 +1100,14 @@ WIF_PROVIDER_ARGS=(
   --attribute-condition="assertion.email=='${BETTERSTACK_SA}'"
   --allowed-audiences="https://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/betterstack-pool/providers/betterstack-provider"
 )
-if gcloud iam workload-identity-pools providers describe betterstack-provider \
-  --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" > /dev/null 2>&1; then
+if PROVIDER_DESCRIPTION=$(gcloud iam workload-identity-pools providers describe betterstack-provider \
+  --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" 2>/dev/null); then
+  # A deleted provider (kept for 30 days, e.g. after a teardown that kept the pool) must be restored first.
+  if grep -q '^state: DELETED' <<<"$PROVIDER_DESCRIPTION"; then
+    echo "  Restoring deleted provider betterstack-provider..."
+    gcloud iam workload-identity-pools providers undelete betterstack-provider \
+      --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT"
+  fi
   gcloud iam workload-identity-pools providers update-oidc betterstack-provider "${WIF_PROVIDER_ARGS[@]}" 2>/dev/null || true
 else
   gcloud iam workload-identity-pools providers create-oidc betterstack-provider "${WIF_PROVIDER_ARGS[@]}" 2>/dev/null || true
