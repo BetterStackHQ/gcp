@@ -697,6 +697,39 @@ test_ingestion_setup_after_teardown_restores_provider() {
   assert_output "Setup complete!"
 }
 
+test_dry_run_without_project() {
+  start_case dry_run_no_project
+  run_setup --ai-sre "$TOKEN" --dry-run
+  assert_status 0
+  check "dry run ran a command" not test -s "$MOCK/calls.log"
+  assert_output "\$ gcloud config get-value project"
+  assert_output "\$ gcloud services enable iam.googleapis.com"
+  assert_output "Dry run complete: nothing was changed."
+}
+
+test_restored_pool_drops_unused_ingestion_provider() {
+  start_case restored_pool
+  echo DELETED >"$MOCK/state/pool"
+  # Restoring a pool brings back its providers, including an old ingestion one.
+  touch "$MOCK/state/provider-betterstack-provider"
+  run_setup --ai-sre "$TOKEN"
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools undelete betterstack-pool"
+  assert_call "gcloud iam workload-identity-pools providers delete betterstack-provider --workload-identity-pool=betterstack-pool --location=global --project=pool-proj --quiet"
+  assert_output "Deleted the restored ingestion provider betterstack-provider: the ingestion setup is no longer in this project."
+  refute_call "providers delete betterstack-ai-sre"
+  assert_output "AI SRE setup complete!"
+
+  start_case restored_pool_ingestion_in_use
+  echo DELETED >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider" "$MOCK/state/sa-betterstack-integration@pool-proj.iam.gserviceaccount.com"
+  run_setup --ai-sre "$TOKEN"
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools undelete betterstack-pool"
+  refute_call "providers delete"
+  refute_output "Deleted the restored ingestion provider"
+}
+
 test_ingestion_mode_still_works() {
   start_case ingestion
   run_setup --project=pool-proj --region=europe-west1 --source-token=src-token --ingesting-host=s1234.eu-nbg-2.betterstackdata.com

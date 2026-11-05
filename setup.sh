@@ -384,6 +384,7 @@ ai_sre_ensure_pool() {
     DELETED*)
       ai_sre_gcloud "Restoring pool ${AI_SRE_POOL}" "$role" \
         iam workload-identity-pools undelete "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
+      ai_sre_drop_restored_ingestion_provider
       ;;
     *)
       ai_sre_gcloud "Creating pool ${AI_SRE_POOL}" "$role" \
@@ -391,6 +392,22 @@ ai_sre_ensure_pool() {
         --display-name="Better Stack Integration"
       ;;
   esac
+}
+
+# Restoring a deleted pool also restores its providers. Delete the ingestion
+# provider again unless the ingestion setup still uses it (its service account exists).
+ai_sre_drop_restored_ingestion_provider() {
+  ai_sre_probe iam workload-identity-pools providers describe betterstack-provider \
+    --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+  [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ] || return 0
+  ai_sre_probe iam service-accounts describe "betterstack-integration@${AI_SRE_PROJECT}.iam.gserviceaccount.com" \
+    --project="$AI_SRE_PROJECT" --format='value(email)'
+  [ -z "$AI_SRE_OUT" ] || return 0
+  ai_sre_gcloud "Deleting the restored provider betterstack-provider" \
+    "roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}" \
+    iam workload-identity-pools providers delete betterstack-provider \
+    --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet
+  echo "  Deleted the restored ingestion provider betterstack-provider: the ingestion setup is no longer in this project."
 }
 
 ai_sre_ensure_provider() {
@@ -605,7 +622,7 @@ ai_sre_main() {
     fi
     if [ "$DRY_RUN" = true ]; then
       ai_sre_show gcloud config get-value project
-      AI_SRE_PROJECT="CURRENT_GCLOUD_PROJECT"
+      AI_SRE_PROJECT="current-gcloud-project"
     else
       AI_SRE_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
       [ -n "$AI_SRE_PROJECT" ] || ai_sre_error "No project given and no current gcloud project. Pass --project <id>."
