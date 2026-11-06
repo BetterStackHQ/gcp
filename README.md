@@ -69,17 +69,17 @@ If the AI SRE setup (`--ai-sre`) added its provider to `betterstack-pool`, teard
 curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- --ai-sre YOUR_TOKEN
 ```
 
-The token is valid for 24 hours and works once. The first project defaults to the current `gcloud` project; pass `--project <id>` to choose another. To connect a further project, use **Add project** on the integration and run its command, which adds `--project <id>`.
+The token is valid for 24 hours and works once. The script connects the current `gcloud` project; pass `--project <id>` to choose another.
 
 ### What gets created
 
-In the first project:
+In the project:
 
 - **Workload identity pool** `betterstack-pool`, reused if the ingestion setup already created it.
 - **Identity provider** `betterstack-ai-sre` in that pool. It trusts Google-signed ID tokens (`https://accounts.google.com`) only from `ai-sre-caller@better-stack.iam.gserviceaccount.com`, and only with the audience generated for your integration. The ingestion provider is left as it is.
 - **Service account** `betterstack-ai-sre@<project>.iam.gserviceaccount.com`, which Better Stack impersonates through that provider (`roles/iam.workloadIdentityUser`). No keys are created.
 
-In every connected project, the service account gets read-only roles and the APIs behind each MCP server are enabled:
+The service account gets read-only roles on the project, and the APIs behind each MCP server are enabled:
 
 | Server | Roles | API |
 |--------|-------|-----|
@@ -92,7 +92,7 @@ In every connected project, the service account gets read-only roles and the API
 | Error Reporting | `roles/errorreporting.viewer` | `clouderrorreporting.googleapis.com` |
 | Kubernetes Engine | `roles/container.clusterViewer` | `container.googleapis.com` |
 
-The first project also enables `iam`, `iamcredentials` and `sts`. The script then registers the project with Better Stack, which checks that it can list the MCP tools before the integration turns active. New IAM grants can take a few minutes to apply, so the script retries for up to 3 minutes.
+The script also enables `iam`, `iamcredentials` and `sts`. The script then registers the project with Better Stack, which checks that it can list the MCP tools before the integration turns active. New IAM grants can take a few minutes to apply, so the script retries for up to 3 minutes.
 
 ### Options
 
@@ -106,7 +106,7 @@ The first project also enables `iam`, `iamcredentials` and `sts`. The script the
 
 ### Permissions and errors
 
-The user running the script needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` (only `roles/serviceusage.serviceUsageAdmin` and `roles/resourcemanager.projectIamAdmin` in further projects). When a step is denied, the script names the missing permission and the role that grants it.
+The user running the script needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin`. When a step is denied, the script names the missing permission and the role that grants it.
 
 If your organization restricts identity providers with `constraints/iam.workloadIdentityPoolProviders`, creating the provider fails and the script prints the command that allows `https://accounts.google.com`, which needs `roles/orgpolicy.policyAdmin`:
 

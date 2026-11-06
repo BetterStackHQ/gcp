@@ -69,10 +69,7 @@ Optional:
 AI SRE (read-only access for Better Stack AI SRE)
 
   --ai-sre <token>           Registration token from the GCP integration in Better Stack
-  --project <id>             Project to connect (default: the current gcloud project).
-                             The first project also holds the identity pool and the
-                             service account. To add another project to the same
-                             integration, use a new token and pass --project.
+  --project <id>             Project to connect (default: the current gcloud project)
   --audit-logs               Turn on Data Access audit logs (DATA_READ) for
                              mcp.googleapis.com. Off by default: they are billed
                              as Cloud Logging ingestion.
@@ -666,8 +663,7 @@ ai_sre_main() {
   echo "  Service account:    $AI_SRE_SA"
   echo "  Connected projects: $(ai_sre_json project_ids)"
   echo ""
-  echo "The integration is now active in Better Stack. To connect another project,"
-  echo "use \"Add project\" on the integration and run the command it shows."
+  echo "The integration is now active in Better Stack."
 }
 
 # --- Parse arguments ---
