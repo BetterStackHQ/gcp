@@ -229,8 +229,9 @@ refute_call() { check "unexpected call: $1" not has_call "$1"; }
 assert_call_count() { check "$(grep -cF -- "$1" "$MOCK/calls.log") calls of '$1', expected $2" call_count_is "$1" "$2"; }
 
 SA="betterstack-ai-sre@pool-proj.iam.gserviceaccount.com"
-DEFAULT_ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser)
-OPTIONAL_ROLES=(roles/cloudtrace.user roles/errorreporting.viewer roles/container.clusterViewer)
+ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser
+  roles/cloudtrace.user roles/errorreporting.viewer roles/container.clusterViewer)
+SERVER_APIS="logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com cloudtrace.googleapis.com clouderrorreporting.googleapis.com container.googleapis.com"
 
 # --- Cases ---
 
@@ -240,16 +241,16 @@ test_first_run() {
   assert_status 0
   assert_call "curl GET https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations/audience auth=[Authorization: Bearer $TOKEN]"
   assert_call "gcloud config get-value project"
-  assert_call "gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com --project=pool-proj"
+  assert_call "gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com $SERVER_APIS --project=pool-proj"
   assert_call "gcloud iam workload-identity-pools create betterstack-pool --location=global --project=pool-proj"
   assert_call "gcloud iam workload-identity-pools providers create-oidc betterstack-ai-sre --workload-identity-pool=betterstack-pool --location=global --project=pool-proj --issuer-uri=https://accounts.google.com --allowed-audiences=$AUDIENCE --attribute-mapping=google.subject=assertion.sub,attribute.sa_email=assertion.email --attribute-condition=assertion.email=='$CALLER'"
   refute_call "betterstack-provider"
   assert_call "gcloud iam service-accounts create betterstack-ai-sre --project=pool-proj"
   local role
-  for role in "${DEFAULT_ROLES[@]}"; do
+  for role in "${ROLES[@]}"; do
     assert_call "gcloud projects add-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=$role --condition=None"
   done
-  for role in "${OPTIONAL_ROLES[@]}"; do refute_call "$role"; done
+  assert_call_count "gcloud projects add-iam-policy-binding" 8
   assert_call "gcloud iam service-accounts add-iam-policy-binding $SA --project=pool-proj --member=principalSet://iam.googleapis.com/projects/111111111111/locations/global/workloadIdentityPools/betterstack-pool/attribute.sa_email/$CALLER --role=roles/iam.workloadIdentityUser"
   refute_call "get-iam-policy"
   assert_call "curl POST https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations auth=[Authorization: Bearer $TOKEN] data=[{\"project_id\": \"pool-proj\", \"project_number\": \"111111111111\", \"service_account_email\": \"$SA\"}]"
@@ -278,13 +279,13 @@ test_added_project() {
   post_responses "200 {\"status\": \"active\", \"project_ids\": [\"pool-proj\", \"added-proj\"]}"
   run_setup --ai-sre "$TOKEN" --project added-proj
   assert_status 0
-  assert_call "gcloud services enable logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com --project=added-proj"
+  assert_call "gcloud services enable $SERVER_APIS --project=added-proj"
   refute_call "iamcredentials"
   refute_call "workload-identity-pools"
   refute_call "service-accounts create"
   refute_call "service-accounts add-iam-policy-binding"
   local role
-  for role in "${DEFAULT_ROLES[@]}"; do
+  for role in "${ROLES[@]}"; do
     assert_call "gcloud projects add-iam-policy-binding added-proj --member=serviceAccount:$SA --role=$role --condition=None"
   done
   refute_call "add-iam-policy-binding pool-proj"
@@ -301,16 +302,11 @@ test_added_project_needs_project_flag() {
   refute_call "gcloud"
 }
 
-test_optional_services_and_audit_logs() {
-  start_case services_audit_logs
+test_audit_logs() {
+  start_case audit_logs
   echo '{"bindings": [], "auditConfigs": [{"service": "allServices", "auditLogConfigs": [{"logType": "ADMIN_READ"}]}], "etag": "BwX1"}' >"$MOCK/state/policy.json"
-  run_setup --ai-sre "$TOKEN" --services cloudtrace,clouderrorreporting,container --audit-logs
+  run_setup --ai-sre "$TOKEN" --audit-logs
   assert_status 0
-  assert_call "cloudresourcemanager.googleapis.com cloudtrace.googleapis.com clouderrorreporting.googleapis.com container.googleapis.com --project=pool-proj"
-  local role
-  for role in "${DEFAULT_ROLES[@]}" "${OPTIONAL_ROLES[@]}"; do
-    assert_call "--role=$role --condition=None"
-  done
   assert_call "gcloud projects set-iam-policy pool-proj"
   check "audit config not merged into the policy" python3 -c '
 import json, sys
@@ -327,19 +323,16 @@ assert p["etag"] == "BwX1" and len(p["auditConfigs"]) == 2, p
   refute_call "set-iam-policy"
 }
 
-test_services_subset_and_unknown() {
-  start_case services_subset
-  run_setup --ai-sre "$TOKEN" --services=container
-  assert_status 0
-  assert_call "--role=roles/container.clusterViewer"
-  refute_call "roles/cloudtrace.user"
-  assert_call "cloudresourcemanager.googleapis.com container.googleapis.com --project"
-
-  start_case services_unknown
-  run_setup --ai-sre "$TOKEN" --services cloudtrace,bigquery
+test_services_option_is_gone() {
+  start_case services_gone
+  run_setup --ai-sre "$TOKEN" --services cloudtrace
   assert_status 1
-  assert_output "Unknown service 'bigquery'"
+  assert_output "Unknown argument: --services"
   refute_call "curl"
+
+  run_setup --help
+  refute_output "--services"
+  refute_output "Preview"
 }
 
 test_rerun_after_partial_setup() {
@@ -504,7 +497,7 @@ test_rejects_unexpected_api_answers() {
 
 test_dry_run() {
   start_case dry_run
-  run_setup --ai-sre "$TOKEN" --dry-run --project pool-proj --services cloudtrace --audit-logs
+  run_setup --ai-sre "$TOKEN" --dry-run --project pool-proj --audit-logs
   assert_status 0
   check "dry run ran a command" not test -s "$MOCK/calls.log"
   assert_output "\$ curl -sS -X GET"
@@ -527,9 +520,9 @@ test_argument_errors() {
   assert_status 1
   assert_output "--ai-sre needs the registration token"
 
-  run_setup --ai-sre "$TOKEN" --services --audit-logs
+  run_setup --ai-sre "$TOKEN" --api-url --audit-logs
   assert_status 1
-  assert_output "--services needs a value."
+  assert_output "--api-url needs a value."
 
   run_setup --ai-sre "$TOKEN" --project example.com:my-proj
   assert_status 1

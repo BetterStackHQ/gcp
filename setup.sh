@@ -21,7 +21,6 @@ SKIP_LOG_FORWARDING=false
 # --- AI SRE mode defaults ---
 AI_SRE=false
 AI_SRE_TOKEN=""
-AI_SRE_SERVICES=""
 AI_SRE_AUDIT_LOGS=false
 AI_SRE_API_URL="https://telemetry.betterstack.com"
 DRY_RUN=false
@@ -74,8 +73,6 @@ AI SRE (read-only access for Better Stack AI SRE)
                              The first project also holds the identity pool and the
                              service account. To add another project to the same
                              integration, use a new token and pass --project.
-  --services <list>          Optional servers, comma-separated, possibly in Preview:
-                             cloudtrace, clouderrorreporting, container
   --audit-logs               Turn on Data Access audit logs (DATA_READ) for
                              mcp.googleapis.com. Off by default: they are billed
                              as Cloud Logging ingestion.
@@ -108,28 +105,29 @@ AI_SRE_CALLER="ai-sre-caller@better-stack.iam.gserviceaccount.com"
 AI_SRE_POOL="betterstack-pool"
 AI_SRE_PROVIDER="betterstack-ai-sre"
 AI_SRE_SA_NAME="betterstack-ai-sre"
-AI_SRE_ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser)
-AI_SRE_APIS=(logging monitoring run cloudresourcemanager)
+# Read-only roles for the MCP servers: Logging, Monitoring, Cloud Run, Resource
+# Manager, Cloud Trace, Error Reporting and Kubernetes Engine.
+AI_SRE_ROLES=(
+  roles/mcp.toolUser
+  roles/logging.viewer
+  roles/monitoring.viewer
+  roles/run.viewer
+  roles/browser
+  roles/cloudtrace.user
+  roles/errorreporting.viewer
+  roles/container.clusterViewer
+)
+AI_SRE_APIS=(logging monitoring run cloudresourcemanager cloudtrace clouderrorreporting container)
 AI_SRE_POOL_APIS=(iam iamcredentials sts)
-AI_SRE_OPTIONAL_SERVICES="cloudtrace clouderrorreporting container"
 AI_SRE_REGISTER_TIMEOUT=180
 AI_SRE_OUT=""
 AI_SRE_STATUS=""
-
-ai_sre_service_role() {
-  case "$1" in
-    cloudtrace) echo "roles/cloudtrace.user" ;;
-    clouderrorreporting) echo "roles/errorreporting.viewer" ;;
-    container) echo "roles/container.clusterViewer" ;;
-    *) return 1 ;;
-  esac
-}
 
 # Whether a value is one of this script's own options (so --ai-sre got no token).
 ai_sre_is_option() {
   case "${1%%=*}" in
     --help|-h|--project|--org-id|--source-token|--ingesting-host|--betterstack-sa|--region|--batch-count \
-      |--skip-log-forwarding|--teardown|--ai-sre|--services|--api-url|--audit-logs|--dry-run) return 0 ;;
+      |--skip-log-forwarding|--teardown|--ai-sre|--api-url|--audit-logs|--dry-run) return 0 ;;
   esac
   return 1
 }
@@ -462,7 +460,7 @@ ai_sre_ensure_service_account() {
 ai_sre_grant_roles() {
   local role
   echo "Granting read-only roles to ${AI_SRE_SA} on ${AI_SRE_PROJECT}..."
-  for role in "${AI_SRE_ROLES_TO_GRANT[@]}"; do
+  for role in "${AI_SRE_ROLES[@]}"; do
     echo "  $role"
     ai_sre_gcloud "Granting ${role}" "roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}" \
       projects add-iam-policy-binding "$AI_SRE_PROJECT" \
@@ -565,8 +563,6 @@ ai_sre_register() {
 }
 
 ai_sre_main() {
-  local service api
-
   if [ -z "$AI_SRE_TOKEN" ] || ai_sre_is_option "$AI_SRE_TOKEN"; then
     ai_sre_error "--ai-sre needs the registration token shown on the GCP integration in Better Stack."
   fi
@@ -580,26 +576,6 @@ ai_sre_main() {
   fi
   AI_SRE_API_URL="${AI_SRE_API_URL%/}"
   [[ "$AI_SRE_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || ai_sre_error "--api-url must be an https URL."
-
-  AI_SRE_ROLES_TO_GRANT=("${AI_SRE_ROLES[@]}")
-  AI_SRE_APIS_TO_ENABLE=("${AI_SRE_APIS[@]}")
-  if [ -n "$AI_SRE_SERVICES" ]; then
-    local requested=()
-    IFS=',' read -r -a requested <<<"$AI_SRE_SERVICES"
-    for service in "${requested[@]}"; do
-      service=$(tr -d '[:space:]' <<<"$service")
-      [ -z "$service" ] && continue
-      if ! ai_sre_service_role "$service" >/dev/null; then
-        ai_sre_error "Unknown service '${service}' in --services. Choose from: ${AI_SRE_OPTIONAL_SERVICES// /, }."
-      fi
-      # Skip duplicates.
-      for api in "${AI_SRE_APIS_TO_ENABLE[@]}"; do
-        [ "$api" = "$service" ] && continue 2
-      done
-      AI_SRE_ROLES_TO_GRANT+=("$(ai_sre_service_role "$service")")
-      AI_SRE_APIS_TO_ENABLE+=("$service")
-    done
-  fi
 
   command -v python3 >/dev/null || ai_sre_error "python3 is required."
   if [ "$DRY_RUN" = false ]; then
@@ -653,7 +629,7 @@ ai_sre_main() {
     echo "  Setup:            roles for the existing service account (identity pool in ${AI_SRE_POOL_PROJECT})"
   fi
   echo "  Service account:  $AI_SRE_SA"
-  echo "  Servers:          ${AI_SRE_APIS_TO_ENABLE[*]}"
+  echo "  Servers:          ${AI_SRE_APIS[*]}"
   echo "  Audit logs:       $([ "$AI_SRE_AUDIT_LOGS" = true ] && echo "on (DATA_READ for mcp.googleapis.com)" || echo "not changed (--audit-logs turns them on)")"
   echo ""
 
@@ -663,14 +639,14 @@ ai_sre_main() {
   fi
 
   if [ "$AI_SRE_MODE" = "pool" ]; then
-    ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS_TO_ENABLE[@]}"
+    ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS[@]}"
     ai_sre_ensure_pool
     ai_sre_ensure_provider
     ai_sre_ensure_service_account
     ai_sre_grant_roles
     ai_sre_allow_impersonation
   else
-    ai_sre_enable_apis "${AI_SRE_APIS_TO_ENABLE[@]}"
+    ai_sre_enable_apis "${AI_SRE_APIS[@]}"
     ai_sre_grant_roles
   fi
   [ "$AI_SRE_AUDIT_LOGS" = true ] && ai_sre_enable_audit_logs
@@ -721,8 +697,6 @@ while [ $# -gt 0 ]; do
       if [ $# -ge 2 ] && ! ai_sre_is_option "$2"; then AI_SRE_TOKEN="$2"; shift; fi
       shift
       ;;
-    --services=*) AI_SRE_SERVICES="${1#*=}"; shift ;;
-    --services) [[ "${2:--}" != -* ]] || { echo "Error: --services needs a value."; exit 1; }; AI_SRE_SERVICES="$2"; shift 2 ;;
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
     --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
     --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
@@ -745,9 +719,9 @@ if [ "$AI_SRE" = true ]; then
   ai_sre_main
   exit 0
 fi
-if [ "$DRY_RUN" = true ] || [ "$AI_SRE_AUDIT_LOGS" = true ] || [ -n "$AI_SRE_SERVICES" ] \
+if [ "$DRY_RUN" = true ] || [ "$AI_SRE_AUDIT_LOGS" = true ] \
   || [ "$AI_SRE_API_URL" != "https://telemetry.betterstack.com" ]; then
-  echo "Error: --services, --audit-logs, --api-url and --dry-run are only available with --ai-sre."
+  echo "Error: --audit-logs, --api-url and --dry-run are only available with --ai-sre."
   exit 1
 fi
 

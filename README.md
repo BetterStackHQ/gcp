@@ -88,9 +88,9 @@ In every connected project, the service account gets read-only roles and the API
 | Cloud Monitoring | `roles/monitoring.viewer` | `monitoring.googleapis.com` |
 | Cloud Run | `roles/run.viewer` | `run.googleapis.com` |
 | Resource Manager | `roles/browser` | `cloudresourcemanager.googleapis.com` |
-| Cloud Trace (`--services cloudtrace`) | `roles/cloudtrace.user` | `cloudtrace.googleapis.com` |
-| Error Reporting (`--services clouderrorreporting`) | `roles/errorreporting.viewer` | `clouderrorreporting.googleapis.com` |
-| Kubernetes Engine (`--services container`) | `roles/container.clusterViewer` | `container.googleapis.com` |
+| Cloud Trace | `roles/cloudtrace.user` | `cloudtrace.googleapis.com` |
+| Error Reporting | `roles/errorreporting.viewer` | `clouderrorreporting.googleapis.com` |
+| Kubernetes Engine | `roles/container.clusterViewer` | `container.googleapis.com` |
 
 The first project also enables `iam`, `iamcredentials` and `sts`. The script then registers the project with Better Stack, which checks that it can list the MCP tools before the integration turns active. New IAM grants can take a few minutes to apply, so the script retries for up to 3 minutes.
 
@@ -100,7 +100,6 @@ The first project also enables `iam`, `iamcredentials` and `sts`. The script the
 |----------|-------------|
 | `--ai-sre <token>` | Registration token from the GCP integration in Better Stack |
 | `--project <id>` | Project to connect (default: the current `gcloud` project) |
-| `--services <list>` | Optional servers, comma-separated: `cloudtrace`, `clouderrorreporting`, `container`. These may still be in Preview at Google. |
 | `--audit-logs` | Turns on Data Access audit logs (`DATA_READ` for `mcp.googleapis.com`), so every MCP call is logged in your project. Off by default: they are billed as Cloud Logging ingestion. |
 | `--api-url <url>` | Better Stack API base URL (default: `https://telemetry.betterstack.com`) |
 | `--dry-run` | Prints every `gcloud` and `curl` call without running any. It assumes a first run, with placeholders for the audience and the project number. |
