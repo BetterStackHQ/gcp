@@ -69,7 +69,7 @@ If the AI SRE setup (`--ai-sre`) added providers to `betterstack-pool`, teardown
 curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- --ai-sre YOUR_TOKEN --project my-project
 ```
 
-The token is valid for 24 hours and works once. Each integration connects one project, and the command only works for the project it was created for. To connect another project, add another integration. Several integrations, from one or more Better Stack teams, can connect the same project.
+The token works once. Each integration connects one project, and the command only works for the project it was created for. To connect another project, add another integration. Several integrations, from one or more Better Stack teams, can connect the same project.
 
 ### What gets created
 

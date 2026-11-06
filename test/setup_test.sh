@@ -655,21 +655,28 @@ test_non_retryable_registration() {
   assert_output "Error: Better Stack refused the registration (HTTP 422: Project number is invalid)."
 }
 
-test_expired_token() {
-  start_case expired_token
-  audience_response 401 '{"error": "Token is invalid or expired"}'
+test_rejected_token() {
+  start_case rejected_token
+  audience_response 401 '{"error": "Token is unknown or already used"}'
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
-  assert_output "Better Stack rejected the registration token (HTTP 401: Token is invalid or expired)"
-  assert_output "Get a new command"
+  assert_output "Better Stack rejected the registration token (HTTP 401: Token is unknown or already used)"
+  assert_output "A token works once."
+  assert_output "copy the command from the integration in Better Stack again and run it."
+  refute_output "24 hours"
+  refute_output "expire"
   refute_call "gcloud"
 
-  start_case expired_token_on_register
-  post_responses '401 {"error": "Token is invalid or expired"}'
+  start_case rejected_token_on_register
+  post_responses '401 {"error": "Token is unknown or already used"}'
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
   assert_call_count "curl POST" 1
   assert_output "Better Stack rejected the registration token"
+
+  run_setup --help
+  refute_output "expire"
+  refute_output "24 hours"
 }
 
 test_api_unreachable() {

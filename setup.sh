@@ -282,8 +282,8 @@ ai_sre_api_error() {
 ai_sre_token_rejected() {
   echo ""
   echo "Error: Better Stack rejected the registration token ($(ai_sre_api_error))."
-  echo "  Tokens are valid for 24 hours and work once. Get a new command from the"
-  echo "  GCP integration in Better Stack and run it again."
+  echo "  A token works once. If the integration in Better Stack is already active, the setup is complete."
+  echo "  If it isn't, copy the command from the integration in Better Stack again and run it."
   exit 1
 }
 
