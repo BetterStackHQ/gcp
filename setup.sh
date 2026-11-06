@@ -708,7 +708,7 @@ ai_sre_main() {
 # --- AI SRE removal (--ai-sre-remove) ---
 
 ai_sre_remove_main() {
-  local role pool_role list_role name others=0
+  local role pool_role list_role name others=0 still_there=false
   if [ "$AI_SRE" = true ]; then
     ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
   fi
@@ -763,10 +763,15 @@ ai_sre_remove_main() {
     --location=global --project="$AI_SRE_PROJECT" --format='value(name)' 2>"$AI_SRE_TMP/gcloud.err"); then
     while IFS= read -r name; do
       name="${name##*/}"
-      if [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]] && [ "$name" != "$AI_SRE_PROVIDER" ]; then
+      if [ "$name" = "$AI_SRE_PROVIDER" ]; then
+        still_there=true
+      elif [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
         others=$((others + 1))
       fi
     done <<<"$AI_SRE_OUT"
+    if [ "$still_there" = true ]; then
+      ai_sre_error "Provider ${AI_SRE_PROVIDER} is still in ${AI_SRE_POOL}: gcloud could not describe or delete it. Run the same command again."
+    fi
   elif ! grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
     ai_sre_gcloud_failed "Listing the providers in ${AI_SRE_POOL}" "$list_role" "$(cat "$AI_SRE_TMP/gcloud.err")"
   fi

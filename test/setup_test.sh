@@ -445,6 +445,19 @@ test_remove_again_completes_the_removal() {
   assert_output "AI SRE access removed from pool-proj."
 }
 
+test_remove_stops_when_the_provider_is_still_there() {
+  start_case remove_describe_fails
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="providers describe $PROVIDER"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.providers.describe) UNAVAILABLE: try again"
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 1
+  assert_output "Provider $PROVIDER is still in betterstack-pool"
+  refute_call "remove-iam-policy-binding"
+  refute_call "service-accounts delete"
+}
+
 test_remove_permission_error() {
   start_case remove_permission
   echo ACTIVE >"$MOCK/state/pool"
