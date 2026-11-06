@@ -458,6 +458,23 @@ test_remove_stops_when_the_provider_is_still_there() {
   refute_call "service-accounts delete"
 }
 
+test_remove_reports_an_unchecked_service_account() {
+  start_case remove_sa_unchecked
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="service-accounts describe $SA"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)."
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 1
+  assert_call "providers delete $PROVIDER"
+  assert_call_count "remove-iam-policy-binding" 8
+  refute_call "service-accounts delete"
+  refute_output "Already deleted."
+  refute_output "AI SRE access removed"
+  assert_output "Could not check service account $SA, so it was not deleted."
+  assert_output "PERMISSION_DENIED"
+}
+
 test_remove_permission_error() {
   start_case remove_permission
   echo ACTIVE >"$MOCK/state/pool"
@@ -852,6 +869,21 @@ test_teardown_keeps_pool_with_ai_sre_provider() {
   assert_output "Keeping WIF pool betterstack-pool: it also holds Better Stack AI SRE providers."
   assert_call "gcloud iam service-accounts delete betterstack-integration@pool-proj.iam.gserviceaccount.com"
   assert_output "Teardown complete."
+}
+
+test_teardown_keeps_pool_when_providers_cannot_be_listed() {
+  start_case teardown_list_fails
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-betterstack-provider" "$MOCK/state/provider-$PROVIDER"
+  export MOCK_FAIL_PATTERN="providers list"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.providers.list) UNAVAILABLE: The service is currently unavailable."
+  run_setup_answering y --teardown --project=pool-proj --region=europe-west1 --ingesting-host=s1.example.com
+  assert_status 0
+  refute_call "gcloud iam workload-identity-pools delete betterstack-pool"
+  assert_call "gcloud iam workload-identity-pools providers delete betterstack-provider --workload-identity-pool=betterstack-pool --location=global --project=pool-proj --quiet"
+  refute_call "providers delete $PROVIDER"
+  assert_output "Keeping WIF pool betterstack-pool: could not check it for Better Stack AI SRE providers."
+  assert_output "UNAVAILABLE"
 }
 
 test_teardown_without_ai_sre_deletes_pool() {

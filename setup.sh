@@ -708,7 +708,7 @@ ai_sre_main() {
 # --- AI SRE removal (--ai-sre-remove) ---
 
 ai_sre_remove_main() {
-  local role pool_role list_role name others=0 still_there=false
+  local role pool_role list_role name others=0 still_there=false sa_state
   if [ "$AI_SRE" = true ]; then
     ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
   fi
@@ -793,13 +793,34 @@ ai_sre_remove_main() {
       fi
     done
     echo "Deleting service account ${AI_SRE_SA}..."
-    ai_sre_probe iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
-    if [ "$DRY_RUN" = true ] || [ -n "$AI_SRE_OUT" ]; then
-      ai_sre_gcloud "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
-        iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet
+    if [ "$DRY_RUN" = true ]; then
+      ai_sre_show gcloud iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
+      sa_state=present
+    elif gcloud iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)' \
+      >/dev/null 2>"$AI_SRE_TMP/gcloud.err"; then
+      sa_state=present
+    elif grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
+      sa_state=deleted
     else
-      echo "  Already deleted."
+      sa_state=unknown
     fi
+    case "$sa_state" in
+      present)
+        ai_sre_gcloud "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+          iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet
+        ;;
+      deleted) echo "  Already deleted." ;;
+      unknown)
+        echo ""
+        echo "Error: Could not check service account ${AI_SRE_SA}, so it was not deleted."
+        echo "  The provider and the service account's roles are removed."
+        echo ""
+        echo "  gcloud said:"
+        sed 's/^/    /' "$AI_SRE_TMP/gcloud.err"
+        ai_sre_rerun_hint
+        exit 1
+        ;;
+    esac
   fi
 
   echo ""
@@ -978,11 +999,20 @@ if [ "$TEARDOWN" = true ]; then
   fi
 
   # The AI SRE setup (--ai-sre) keeps its providers in the same pool: keep the pool for them.
-  AI_SRE_PROVIDERS=$(gcloud iam workload-identity-pools providers list \
+  # If the pool can't be listed (other than because it doesn't exist), keep it to be safe.
+  KEEP_POOL_REASON=""
+  if AI_SRE_PROVIDERS=$(gcloud iam workload-identity-pools providers list \
     --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" \
-    --format='value(name)' 2>/dev/null || true)
-  if grep -qE '/providers/betterstack-ai-sre(-[0-9a-f]{8})?$' <<<"$AI_SRE_PROVIDERS"; then
-    echo "Keeping WIF pool betterstack-pool: it also holds Better Stack AI SRE providers."
+    --format='value(name)' 2>&1); then
+    if grep -qE '/providers/betterstack-ai-sre(-[0-9a-f]{8})?$' <<<"$AI_SRE_PROVIDERS"; then
+      KEEP_POOL_REASON="it also holds Better Stack AI SRE providers."
+    fi
+  elif ! grep -q "NOT_FOUND" <<<"$AI_SRE_PROVIDERS"; then
+    KEEP_POOL_REASON="could not check it for Better Stack AI SRE providers."
+    while IFS= read -r LINE; do echo "  $LINE"; done <<<"$AI_SRE_PROVIDERS"
+  fi
+  if [ -n "$KEEP_POOL_REASON" ]; then
+    echo "Keeping WIF pool betterstack-pool: ${KEEP_POOL_REASON}"
     echo "Deleting WIF provider betterstack-provider..."
     if ! gcloud iam workload-identity-pools providers delete betterstack-provider \
       --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" --quiet 2>&1; then
