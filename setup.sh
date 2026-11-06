@@ -112,7 +112,7 @@ AI_SRE_ROLES=(
   roles/browser
   roles/cloudtrace.user
   roles/errorreporting.viewer
-  roles/container.clusterViewer
+  roles/container.viewer
 )
 AI_SRE_APIS=(logging monitoring run cloudresourcemanager cloudtrace clouderrorreporting container)
 AI_SRE_POOL_APIS=(iam iamcredentials sts)

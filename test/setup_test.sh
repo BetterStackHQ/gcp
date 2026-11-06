@@ -230,7 +230,7 @@ assert_call_count() { check "$(grep -cF -- "$1" "$MOCK/calls.log") calls of '$1'
 
 SA="betterstack-ai-sre@pool-proj.iam.gserviceaccount.com"
 ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser
-  roles/cloudtrace.user roles/errorreporting.viewer roles/container.clusterViewer)
+  roles/cloudtrace.user roles/errorreporting.viewer roles/container.viewer)
 SERVER_APIS="logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com cloudtrace.googleapis.com clouderrorreporting.googleapis.com container.googleapis.com"
 
 # --- Cases ---
@@ -251,6 +251,7 @@ test_first_run() {
     assert_call "gcloud projects add-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=$role --condition=None"
   done
   assert_call_count "gcloud projects add-iam-policy-binding" 8
+  refute_call "roles/container.clusterViewer"
   assert_call "gcloud iam service-accounts add-iam-policy-binding $SA --project=pool-proj --member=principalSet://iam.googleapis.com/projects/111111111111/locations/global/workloadIdentityPools/betterstack-pool/attribute.sa_email/$CALLER --role=roles/iam.workloadIdentityUser"
   refute_call "get-iam-policy"
   assert_call "curl POST https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations auth=[Authorization: Bearer $TOKEN] data=[{\"project_id\": \"pool-proj\", \"project_number\": \"111111111111\", \"service_account_email\": \"$SA\"}]"

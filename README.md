@@ -90,7 +90,7 @@ The service account gets read-only roles on the project, and the APIs behind eac
 | Resource Manager | `roles/browser` | `cloudresourcemanager.googleapis.com` |
 | Cloud Trace | `roles/cloudtrace.user` | `cloudtrace.googleapis.com` |
 | Error Reporting | `roles/errorreporting.viewer` | `clouderrorreporting.googleapis.com` |
-| Kubernetes Engine | `roles/container.clusterViewer` | `container.googleapis.com` |
+| Kubernetes Engine | `roles/container.viewer` | `container.googleapis.com` |
 
 The script also enables `iam`, `iamcredentials` and `sts`. The script then registers the project with Better Stack, which checks that it can list the MCP tools before the integration turns active. New IAM grants can take a few minutes to apply, so the script retries for up to 3 minutes.
 
