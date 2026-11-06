@@ -21,6 +21,8 @@ SKIP_LOG_FORWARDING=false
 # --- AI SRE mode defaults ---
 AI_SRE=false
 AI_SRE_TOKEN=""
+AI_SRE_REMOVE=false
+AI_SRE_REMOVE_PROVIDER=""
 AI_SRE_AUDIT_LOGS=false
 AI_SRE_API_URL="https://telemetry.betterstack.com"
 DRY_RUN=false
@@ -47,7 +49,8 @@ Better Stack GCP Integration Setup
 Usage:
   $(basename "$0") --project=<id> --region=<region> --source-token=<token> --ingesting-host=<host> [options]
   $(basename "$0") --teardown --project=<id> --region=<region> --ingesting-host=<host> [--org-id=<id>]
-  $(basename "$0") --ai-sre <token> [--project <id>] [AI SRE options]
+  $(basename "$0") --ai-sre <token> --project <id> [AI SRE options]
+  $(basename "$0") --ai-sre-remove <provider id> --project <id> [--dry-run]
   $(basename "$0") --help
 
 Log and metrics ingestion
@@ -69,12 +72,15 @@ Optional:
 AI SRE (read-only access for Better Stack AI SRE)
 
   --ai-sre <token>           Registration token from the GCP integration in Better Stack
-  --project <id>             Project to connect (default: the current gcloud project)
+  --project <id>             Project to connect (required; the one shown in Better Stack)
   --audit-logs               Turn on Data Access audit logs (DATA_READ) for
                              mcp.googleapis.com. Off by default: they are billed
                              as Cloud Logging ingestion.
   --api-url <url>            Better Stack API base URL (default: ${AI_SRE_API_URL})
   --dry-run                  Print every gcloud and curl call without running any
+  --ai-sre-remove <id>       Remove an integration's provider (betterstack-ai-sre-<8 hex>,
+                             printed at the end of the setup). With no other AI SRE
+                             provider left, also removes the service account and its roles.
 EOF
 }
 
@@ -87,20 +93,24 @@ print_regions() {
 
 # --- AI SRE mode (--ai-sre) ---
 #
-# Gives Better Stack AI SRE read-only access to GCP projects through Google's
-# MCP servers. In the first project it creates (or reuses) the betterstack-pool
-# workload identity pool, adds a betterstack-ai-sre provider that accepts only
-# Better Stack's AI SRE caller and this integration's audience, and creates a
-# read-only betterstack-ai-sre service account. Every further project only
-# grants that service account its roles. Each project is then registered with
-# Better Stack using the one-time token from the integration's page.
+# Gives Better Stack AI SRE read-only access to a GCP project through Google's
+# MCP servers. It creates (or reuses) the betterstack-pool workload identity
+# pool, adds a provider for this integration (betterstack-ai-sre-<8 hex>) that
+# accepts only Better Stack's AI SRE caller and the integration's audience, and
+# creates a read-only betterstack-ai-sre service account. Several integrations,
+# from one or more Better Stack teams, can connect the same project: each gets
+# its own provider, and they share the service account. The project is then
+# registered with Better Stack using the one-time token from the integration.
 #
 # Every step checks what exists first, so running the same command again after
-# a failure completes the setup.
+# a failure completes the setup. --ai-sre-remove undoes it for one integration.
 
 AI_SRE_CALLER="ai-sre-caller@better-stack.iam.gserviceaccount.com"
 AI_SRE_POOL="betterstack-pool"
-AI_SRE_PROVIDER="betterstack-ai-sre"
+AI_SRE_PROVIDER_PREFIX="betterstack-ai-sre-"
+AI_SRE_PROVIDER=""
+AI_SRE_PROVIDER_CREATED=false
+AI_SRE_SCRIPT_URL="https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh"
 AI_SRE_SA_NAME="betterstack-ai-sre"
 # Read-only roles for the MCP servers: Logging, Monitoring, Cloud Run, Resource
 # Manager, Cloud Trace, Error Reporting and Kubernetes Engine.
@@ -124,7 +134,7 @@ AI_SRE_STATUS=""
 ai_sre_is_option() {
   case "${1%%=*}" in
     --help|-h|--project|--org-id|--source-token|--ingesting-host|--betterstack-sa|--region|--batch-count \
-      |--skip-log-forwarding|--teardown|--ai-sre|--api-url|--audit-logs|--dry-run) return 0 ;;
+      |--skip-log-forwarding|--teardown|--ai-sre|--ai-sre-remove|--api-url|--audit-logs|--dry-run) return 0 ;;
   esac
   return 1
 }
@@ -303,6 +313,7 @@ ai_sre_fetch_audience() {
   done
   if [ "$DRY_RUN" = true ]; then
     AI_SRE_AUDIENCE="AUDIENCE_FROM_BETTER_STACK"
+    AI_SRE_PROVIDER="${AI_SRE_PROVIDER_PREFIX}XXXXXXXX"
     AI_SRE_KNOWN_POOL_PROJECT=""
     AI_SRE_KNOWN_POOL_NUMBER=""
     AI_SRE_KNOWN_SA=""
@@ -331,6 +342,22 @@ ai_sre_fetch_audience() {
   if [ -n "$caller" ] && [ "$caller" != "$AI_SRE_CALLER" ]; then
     ai_sre_error "Better Stack names '${caller}' as its AI SRE caller, but this script trusts only ${AI_SRE_CALLER}. Use the latest version of this script."
   fi
+
+  # The integration's provider is named after the UUID that ends its audience.
+  if ! [[ "$AI_SRE_AUDIENCE" =~ /([0-9A-Fa-f]{8})-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    ai_sre_error "Better Stack returned an unexpected audience: '${AI_SRE_AUDIENCE}'."
+  fi
+  AI_SRE_PROVIDER="${AI_SRE_PROVIDER_PREFIX}$(tr 'A-F' 'a-f' <<<"${BASH_REMATCH[1]}")"
+  local provider_id project_id
+  provider_id=$(ai_sre_json provider_id)
+  if [ "$provider_id" != "$AI_SRE_PROVIDER" ]; then
+    ai_sre_error "Better Stack returned an unexpected provider ID: '${provider_id}' (expected ${AI_SRE_PROVIDER}). Use the latest version of this script."
+  fi
+  # Nothing has changed yet: refuse a project other than the integration's.
+  project_id=$(ai_sre_json project_id)
+  if [ "$project_id" != "$AI_SRE_PROJECT" ]; then
+    ai_sre_error "This command is for project ${project_id:-(none)}. Copy the command from the integration in Better Stack again."
+  fi
   if [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ]; then
     if [ "$AI_SRE_KNOWN_SA" != "${AI_SRE_SA_NAME}@${AI_SRE_KNOWN_POOL_PROJECT}.iam.gserviceaccount.com" ] \
       || ! [[ "$AI_SRE_KNOWN_POOL_NUMBER" =~ ^[0-9]+$ ]]; then
@@ -338,6 +365,7 @@ ai_sre_fetch_audience() {
     fi
   fi
   echo "  Audience: $AI_SRE_AUDIENCE"
+  echo "  Provider: $AI_SRE_PROVIDER"
   [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ] && echo "  Already connected: $(ai_sre_json project_ids) (identity pool in ${AI_SRE_KNOWN_POOL_PROJECT})"
   echo ""
 }
@@ -430,6 +458,7 @@ ai_sre_ensure_provider() {
     ai_sre_gcloud "Restoring provider ${AI_SRE_PROVIDER}" "$role" \
       iam workload-identity-pools providers undelete "$AI_SRE_PROVIDER" \
       --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
+    AI_SRE_PROVIDER_CREATED=true
     AI_SRE_OUT="ACTIVE"
   fi
   if [ "$AI_SRE_OUT" = "ACTIVE" ]; then
@@ -439,6 +468,7 @@ ai_sre_ensure_provider() {
     ai_sre_gcloud "Creating provider ${AI_SRE_PROVIDER}" "$role" \
       iam workload-identity-pools providers create-oidc "$AI_SRE_PROVIDER" "${args[@]}" \
       --display-name="Better Stack AI SRE"
+    AI_SRE_PROVIDER_CREATED=true
   fi
 }
 
@@ -508,10 +538,19 @@ else:
     projects set-iam-policy "$AI_SRE_PROJECT" "$policy_file" --quiet
 }
 
+# After a refusal, deletes the integration's provider if this run created it.
+ai_sre_delete_own_provider() {
+  [ "$AI_SRE_PROVIDER_CREATED" = true ] || return 0
+  ai_sre_gcloud "Deleting provider ${AI_SRE_PROVIDER}" "roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}" \
+    iam workload-identity-pools providers delete "$AI_SRE_PROVIDER" \
+    --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet
+  echo "  Deleted provider ${AI_SRE_PROVIDER}, which this run created."
+}
+
 ai_sre_register() {
   local body retryable unanswered=false
-  body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3]}))' \
-    "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA")
+  body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3], "provider_id": sys.argv[4]}))' \
+    "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA" "$AI_SRE_PROVIDER")
   echo "Registering ${AI_SRE_PROJECT} with Better Stack..."
   echo "  Better Stack checks that it can use the new access. Google can take a few minutes"
   echo "  to apply IAM changes, so this retries for up to $((AI_SRE_REGISTER_TIMEOUT / 60)) minutes."
@@ -537,6 +576,7 @@ ai_sre_register() {
         if [ "$retryable" != "true" ]; then
           echo ""
           echo "Error: Better Stack refused the registration ($(ai_sre_api_error))."
+          ai_sre_delete_own_provider
           exit 1
         fi
         ;;
@@ -559,7 +599,17 @@ ai_sre_register() {
   done
 }
 
+# Sets AI_SRE_PROJECT from --project, which is required.
+ai_sre_require_project() {
+  AI_SRE_PROJECT="${PROJECT:-}"
+  [ -n "$AI_SRE_PROJECT" ] || ai_sre_error "--project is required: pass the project ID shown on the integration in Better Stack."
+  [[ "$AI_SRE_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || ai_sre_error "'${AI_SRE_PROJECT}' is not a valid project ID (domain-scoped projects are not supported)."
+}
+
 ai_sre_main() {
+  if [ "$AI_SRE_REMOVE" = true ]; then
+    ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
+  fi
   if [ -z "$AI_SRE_TOKEN" ] || ai_sre_is_option "$AI_SRE_TOKEN"; then
     ai_sre_error "--ai-sre needs the registration token shown on the GCP integration in Better Stack."
   fi
@@ -571,6 +621,7 @@ ai_sre_main() {
     || [ "$BETTERSTACK_SA" != "gcp-integration@better-stack.iam.gserviceaccount.com" ] || [ "$BATCH_COUNT" != "100" ]; then
     ai_sre_error "--ai-sre can't be combined with the ingestion options (--teardown, --org-id, --region, --source-token, --ingesting-host, --skip-log-forwarding, --betterstack-sa, --batch-count)."
   fi
+  ai_sre_require_project
   AI_SRE_API_URL="${AI_SRE_API_URL%/}"
   [[ "$AI_SRE_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || ai_sre_error "--api-url must be an https URL."
 
@@ -594,21 +645,6 @@ ai_sre_main() {
   fi
 
   ai_sre_fetch_audience
-
-  AI_SRE_PROJECT="${PROJECT:-}"
-  if [ -z "$AI_SRE_PROJECT" ]; then
-    if [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ]; then
-      ai_sre_error "This integration is already connected to ${AI_SRE_KNOWN_POOL_PROJECT}. To add another project, run the command again with --project <id>."
-    fi
-    if [ "$DRY_RUN" = true ]; then
-      ai_sre_show gcloud config get-value project
-      AI_SRE_PROJECT="current-gcloud-project"
-    else
-      AI_SRE_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
-      [ -n "$AI_SRE_PROJECT" ] || ai_sre_error "No project given and no current gcloud project. Pass --project <id>."
-    fi
-  fi
-  [[ "$AI_SRE_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || ai_sre_error "'${AI_SRE_PROJECT}' is not a valid project ID (domain-scoped projects are not supported)."
 
   if [ -z "$AI_SRE_KNOWN_POOL_PROJECT" ] || [ "$AI_SRE_KNOWN_POOL_PROJECT" = "$AI_SRE_PROJECT" ]; then
     AI_SRE_MODE="pool"
@@ -664,6 +700,110 @@ ai_sre_main() {
   echo "  Connected projects: $(ai_sre_json project_ids)"
   echo ""
   echo "The integration is now active in Better Stack."
+  echo ""
+  echo "To remove AI SRE's access from this project later:"
+  echo "  curl -fsSL ${AI_SRE_SCRIPT_URL} | bash -s -- --ai-sre-remove ${AI_SRE_PROVIDER} --project ${AI_SRE_POOL_PROJECT}"
+}
+
+# --- AI SRE removal (--ai-sre-remove) ---
+
+ai_sre_remove_main() {
+  local role pool_role list_role name others=0
+  if [ "$AI_SRE" = true ]; then
+    ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
+  fi
+  if ! [[ "$AI_SRE_REMOVE_PROVIDER" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
+    ai_sre_error "--ai-sre-remove needs the provider ID printed at the end of the setup (betterstack-ai-sre-<8 hex>)."
+  fi
+  if [ "$TEARDOWN" = true ] || [ "$SKIP_LOG_FORWARDING" = true ] || [ -n "$ORG_ID" ] || [ -n "$REGION" ] \
+    || [ -n "${SOURCE_TOKEN:-}" ] || [ -n "${INGESTING_HOST:-}" ] || [ "$AI_SRE_AUDIT_LOGS" = true ] \
+    || [ "$AI_SRE_API_URL" != "https://telemetry.betterstack.com" ] \
+    || [ "$BETTERSTACK_SA" != "gcp-integration@better-stack.iam.gserviceaccount.com" ] || [ "$BATCH_COUNT" != "100" ]; then
+    ai_sre_error "--ai-sre-remove takes only --project and --dry-run."
+  fi
+  ai_sre_require_project
+  if [ "$DRY_RUN" = false ]; then
+    command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
+  fi
+  AI_SRE_TMP=$(mktemp -d)
+  # shellcheck disable=SC2064 # expand the path now
+  trap "rm -rf '$AI_SRE_TMP'" EXIT
+  AI_SRE_POOL_PROJECT="$AI_SRE_PROJECT"
+  AI_SRE_PROVIDER="$AI_SRE_REMOVE_PROVIDER"
+  AI_SRE_SA="${AI_SRE_SA_NAME}@${AI_SRE_PROJECT}.iam.gserviceaccount.com"
+  pool_role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
+  list_role="roles/iam.workloadIdentityPoolViewer on project ${AI_SRE_PROJECT}"
+
+  echo "Better Stack AI SRE Removal"
+  echo "==========================="
+  echo ""
+  if [ "$DRY_RUN" = true ]; then
+    echo "Dry run: printing every gcloud call without running any."
+    echo ""
+  fi
+
+  echo "Removing provider ${AI_SRE_PROVIDER} from ${AI_SRE_POOL} in ${AI_SRE_PROJECT}..."
+  ai_sre_probe iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
+    --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+  if [ "$DRY_RUN" = true ] || [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ]; then
+    ai_sre_gcloud "Deleting provider ${AI_SRE_PROVIDER}" "$pool_role" \
+      iam workload-identity-pools providers delete "$AI_SRE_PROVIDER" \
+      --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet
+    echo "  Deleted provider ${AI_SRE_PROVIDER}."
+  else
+    echo "  Provider ${AI_SRE_PROVIDER} is already removed."
+  fi
+
+  # The service account and its roles go only with the last AI SRE provider.
+  echo "Checking for other Better Stack AI SRE providers..."
+  if [ "$DRY_RUN" = true ]; then
+    ai_sre_show gcloud iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
+      --location=global --project="$AI_SRE_PROJECT" --format='value(name)'
+  elif AI_SRE_OUT=$(gcloud iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
+    --location=global --project="$AI_SRE_PROJECT" --format='value(name)' 2>"$AI_SRE_TMP/gcloud.err"); then
+    while IFS= read -r name; do
+      name="${name##*/}"
+      if [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]] && [ "$name" != "$AI_SRE_PROVIDER" ]; then
+        others=$((others + 1))
+      fi
+    done <<<"$AI_SRE_OUT"
+  elif ! grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
+    ai_sre_gcloud_failed "Listing the providers in ${AI_SRE_POOL}" "$list_role" "$(cat "$AI_SRE_TMP/gcloud.err")"
+  fi
+  if [ "$others" -gt 0 ]; then
+    echo "  Kept ${AI_SRE_SA} and its roles: ${others} other Better Stack AI SRE integration$([ "$others" -gt 1 ] && echo "s") in this project still $([ "$others" -gt 1 ] && echo "use" || echo "uses") them."
+  else
+    echo "Removing the roles of ${AI_SRE_SA}..."
+    for role in "${AI_SRE_ROLES[@]}"; do
+      echo "  $role"
+      if [ "$DRY_RUN" = true ]; then
+        ai_sre_show gcloud projects remove-iam-policy-binding "$AI_SRE_PROJECT" \
+          --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet
+      elif ! gcloud projects remove-iam-policy-binding "$AI_SRE_PROJECT" \
+        --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet \
+        >/dev/null 2>"$AI_SRE_TMP/gcloud.err"; then
+        # A binding that is already gone is fine.
+        grep -qi "not found" "$AI_SRE_TMP/gcloud.err" || ai_sre_gcloud_failed "Removing ${role}" \
+          "roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}" "$(cat "$AI_SRE_TMP/gcloud.err")"
+      fi
+    done
+    echo "Deleting service account ${AI_SRE_SA}..."
+    ai_sre_probe iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
+    if [ "$DRY_RUN" = true ] || [ -n "$AI_SRE_OUT" ]; then
+      ai_sre_gcloud "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+        iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet
+    else
+      echo "  Already deleted."
+    fi
+  fi
+
+  echo ""
+  if [ "$DRY_RUN" = true ]; then
+    echo "Dry run complete: nothing was changed."
+    return 0
+  fi
+  echo "AI SRE access removed from ${AI_SRE_PROJECT}."
+  echo "The workload identity pool ${AI_SRE_POOL} stays: log ingestion may use it."
 }
 
 # --- Parse arguments ---
@@ -693,6 +833,12 @@ while [ $# -gt 0 ]; do
       if [ $# -ge 2 ] && ! ai_sre_is_option "$2"; then AI_SRE_TOKEN="$2"; shift; fi
       shift
       ;;
+    --ai-sre-remove=*) AI_SRE_REMOVE=true; AI_SRE_REMOVE_PROVIDER="${1#*=}"; shift ;;
+    --ai-sre-remove)
+      AI_SRE_REMOVE=true
+      if [ $# -ge 2 ] && ! ai_sre_is_option "$2"; then AI_SRE_REMOVE_PROVIDER="$2"; shift; fi
+      shift
+      ;;
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
     --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
     --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
@@ -715,9 +861,13 @@ if [ "$AI_SRE" = true ]; then
   ai_sre_main
   exit 0
 fi
+if [ "$AI_SRE_REMOVE" = true ]; then
+  ai_sre_remove_main
+  exit 0
+fi
 if [ "$DRY_RUN" = true ] || [ "$AI_SRE_AUDIT_LOGS" = true ] \
   || [ "$AI_SRE_API_URL" != "https://telemetry.betterstack.com" ]; then
-  echo "Error: --audit-logs, --api-url and --dry-run are only available with --ai-sre."
+  echo "Error: --audit-logs, --api-url and --dry-run are only available with --ai-sre or --ai-sre-remove."
   exit 1
 fi
 
@@ -822,12 +972,12 @@ if [ "$TEARDOWN" = true ]; then
     fi
   fi
 
-  # The AI SRE setup (--ai-sre) keeps its own provider in the same pool: keep the pool for it.
-  AI_SRE_PROVIDER_STATE=$(gcloud iam workload-identity-pools providers describe betterstack-ai-sre \
+  # The AI SRE setup (--ai-sre) keeps its providers in the same pool: keep the pool for them.
+  AI_SRE_PROVIDERS=$(gcloud iam workload-identity-pools providers list \
     --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" \
-    --format='value(state)' 2>/dev/null || true)
-  if [ "$AI_SRE_PROVIDER_STATE" = "ACTIVE" ]; then
-    echo "Keeping WIF pool betterstack-pool: it also holds the betterstack-ai-sre provider used by Better Stack AI SRE."
+    --format='value(name)' 2>/dev/null || true)
+  if grep -qE '/providers/betterstack-ai-sre(-[0-9a-f]{8})?$' <<<"$AI_SRE_PROVIDERS"; then
+    echo "Keeping WIF pool betterstack-pool: it also holds Better Stack AI SRE providers."
     echo "Deleting WIF provider betterstack-provider..."
     if ! gcloud iam workload-identity-pools providers delete betterstack-provider \
       --workload-identity-pool=betterstack-pool --location=global --project="$PROJECT" --quiet 2>&1; then

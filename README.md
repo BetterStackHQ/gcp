@@ -52,7 +52,7 @@ The fastest way to deploy. Requires the [gcloud CLI](https://cloud.google.com/sd
 
 ### Teardown
 
-If the AI SRE setup (`--ai-sre`) added its provider to `betterstack-pool`, teardown keeps the pool and deletes only the ingestion provider.
+If the AI SRE setup (`--ai-sre`) added providers to `betterstack-pool`, teardown keeps the pool and deletes only the ingestion provider.
 
 ```bash
 ./setup.sh --teardown \
@@ -63,21 +63,21 @@ If the AI SRE setup (`--ai-sre`) added its provider to `betterstack-pool`, teard
 
 ## AI SRE
 
-`--ai-sre` gives [Better Stack AI SRE](https://betterstack.com) read-only access to your projects through Google's MCP servers. Create a GCP integration in Better Stack, then run the command it shows, for example in Cloud Shell:
+`--ai-sre` gives [Better Stack AI SRE](https://betterstack.com) read-only access to a project through Google's MCP servers. Create a GCP integration in Better Stack for the project, then run the command it shows, for example in Cloud Shell:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- --ai-sre YOUR_TOKEN
+curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- --ai-sre YOUR_TOKEN --project my-project
 ```
 
-The token is valid for 24 hours and works once. The script connects the current `gcloud` project; pass `--project <id>` to choose another.
+The token is valid for 24 hours and works once. Each integration connects one project, and the command only works for the project it was created for. To connect another project, add another integration. Several integrations, from one or more Better Stack teams, can connect the same project.
 
 ### What gets created
 
 In the project:
 
 - **Workload identity pool** `betterstack-pool`, reused if the ingestion setup already created it.
-- **Identity provider** `betterstack-ai-sre` in that pool. It trusts Google-signed ID tokens (`https://accounts.google.com`) only from `ai-sre-caller@better-stack.iam.gserviceaccount.com`, and only with the audience generated for your integration. The ingestion provider is left as it is.
-- **Service account** `betterstack-ai-sre@<project>.iam.gserviceaccount.com`, which Better Stack impersonates through that provider (`roles/iam.workloadIdentityUser`). No keys are created.
+- **Identity provider** `betterstack-ai-sre-<8 hex>` in that pool, one per integration, named after the integration's audience. It trusts Google-signed ID tokens (`https://accounts.google.com`) only from `ai-sre-caller@better-stack.iam.gserviceaccount.com`, and only with the audience generated for that integration. Other providers in the pool, including the ingestion provider, are left as they are.
+- **Service account** `betterstack-ai-sre@<project>.iam.gserviceaccount.com`, shared by every AI SRE integration of the project, which Better Stack impersonates through their providers (`roles/iam.workloadIdentityUser`). No keys are created.
 
 The service account gets read-only roles on the project, and the APIs behind each MCP server are enabled:
 
@@ -99,10 +99,10 @@ The script also enables `iam`, `iamcredentials` and `sts`. The script then regis
 | Argument | Description |
 |----------|-------------|
 | `--ai-sre <token>` | Registration token from the GCP integration in Better Stack |
-| `--project <id>` | Project to connect (default: the current `gcloud` project) |
+| `--project <id>` | Project to connect (required): the one shown on the integration in Better Stack |
 | `--audit-logs` | Turns on Data Access audit logs (`DATA_READ` for `mcp.googleapis.com`), so every MCP call is logged in your project. Off by default: they are billed as Cloud Logging ingestion. |
 | `--api-url <url>` | Better Stack API base URL (default: `https://telemetry.betterstack.com`) |
-| `--dry-run` | Prints every `gcloud` and `curl` call without running any. It assumes a first run, with placeholders for the audience and the project number. |
+| `--dry-run` | Prints every `gcloud` and `curl` call without running any. It assumes a first run, with placeholders for the audience, the provider and the project number. |
 
 ### Permissions and errors
 
@@ -115,7 +115,18 @@ gcloud resource-manager org-policies allow constraints/iam.workloadIdentityPoolP
   https://accounts.google.com --project=my-project
 ```
 
-Every step checks what already exists, so after any failure, fix the cause and run the same command again.
+Every step checks what already exists, so after any failure, fix the cause and run the same command again. If Better Stack refuses the registration (for example, when the project is already connected to your team), the script deletes the provider it just created.
+
+### Removal
+
+A successful setup ends by printing the command that removes the integration's access:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/setup.sh | bash -s -- \
+  --ai-sre-remove betterstack-ai-sre-<8 hex> --project my-project
+```
+
+It deletes that integration's provider. When no other AI SRE provider is left in the pool, it also removes the service account's roles and deletes the service account. The pool stays, since log ingestion may use it, and Data Access audit logs stay as they are. Add `--dry-run` to see the commands first. Removing the integration in Better Stack already ends its access: this only tidies up the project.
 
 ## Terraform
 
