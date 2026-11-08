@@ -7,7 +7,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/ai-sre.sh"
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ai-sre-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 TOKEN="test-token-0123456789abcdef0123456789abcdef"
@@ -45,12 +45,9 @@ arg_value() { # arg_value --project
 }
 
 case "$ARGS" in
-  "config get-value project") echo "${MOCK_DEFAULT_PROJECT:-}" ;;
-  "auth print-access-token") echo "ya29.mock" ;;
   "projects describe "*)
     case "$3" in
       pool-proj) echo "111111111111" ;;
-      added-proj) echo "222222222222" ;;
       *) echo "999999999999" ;;
     esac
     ;;
@@ -62,6 +59,7 @@ case "$ARGS" in
   "iam workload-identity-pools undelete "*) echo ACTIVE >"$S/pool" ;;
   # A deleted provider stays describable in state DELETED, as at Google (for 30 days).
   "iam workload-identity-pools providers list "*)
+    [ -f "$S/pool" ] || { echo "ERROR: (gcloud.iam.workload-identity-pools.providers.list) NOT_FOUND: Requested entity was not found." >&2; exit 1; }
     for f in "$S"/provider-*; do
       [ -f "$f" ] || continue
       [ "$(cat "$f")" = DELETED ] && continue
@@ -91,7 +89,10 @@ case "$ARGS" in
     [ -f "$S/sa-$4" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
     echo "$4"
     ;;
-  "iam service-accounts delete "*) rm -f "$S/sa-$4" ;;
+  "iam service-accounts delete "*)
+    [ -f "$S/sa-$4" ] || { echo "ERROR: (gcloud.iam.service-accounts.delete) NOT_FOUND: Service account projects/-/serviceAccounts/$4 does not exist." >&2; exit 1; }
+    rm -f "$S/sa-$4"
+    ;;
   "iam service-accounts create "*)
     touch "$S/sa-$4@$(arg_value --project).iam.gserviceaccount.com"
     ;;
@@ -109,7 +110,6 @@ case "$ARGS" in
     cat "$S/policy.json" 2>/dev/null || echo '{"bindings": [], "etag": "BwX1"}'
     ;;
   "projects set-iam-policy "*) cp "$4" "$S/policy.json" ;;
-  "logging sinks describe "*) echo "serviceAccount:sink-writer@example.iam.gserviceaccount.com" ;;
   *) : ;;
 esac
 exit 0
@@ -156,9 +156,6 @@ respond() { # respond <"STATUS BODY">
 }
 
 case "$url" in
-  *:testIamPermissions)
-    respond "200 $(python3 -c 'import json,sys; print(json.dumps({"permissions": json.loads(sys.argv[1])["permissions"]}))' "$data")"
-    ;;
   */api/v1/ai-sre/gcp-registrations/audience) respond "$(next_response "$MOCK/audience.response")" ;;
   */api/v1/ai-sre/gcp-registrations) respond "$(next_response "$MOCK/post.responses")" ;;
   *) echo "mock curl: unexpected URL $url" >&2; exit 2 ;;
@@ -183,14 +180,13 @@ start_case() {
   mkdir -p "$MOCK/state"
   : >"$MOCK/calls.log"
   unset MOCK_FAIL_PATTERN MOCK_FAIL_MESSAGE MOCK_SA_LAG
-  export MOCK_DEFAULT_PROJECT="pool-proj"
   audience_response 200 "$(first_audience)"
   post_responses "200 {\"status\": \"active\", \"project_ids\": [\"pool-proj\"]}"
 }
 
-# first_audience [project_id]: the audience answer of an integration with no registered project yet.
+# first_audience: the audience answer of an integration with no registered project yet.
 first_audience() {
-  echo "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"${1:-pool-proj}\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": null, \"pool_project_number\": null, \"service_account_email\": null, \"project_ids\": []}"
+  echo "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"pool-proj\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": null, \"pool_project_number\": null, \"service_account_email\": null, \"project_ids\": []}"
 }
 
 audience_response() { echo "$1 $2" >"$MOCK/audience.response"; }
@@ -201,15 +197,6 @@ post_responses() { printf '%s\n' "$@" >"$MOCK/post.responses"; }
 run_setup() {
   : >"$MOCK/calls.log"
   OUTPUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" "$@" 2>&1 </dev/null)
-  STATUS=$?
-}
-
-# run_setup_answering <answer> <args...>: like run_setup, typing <answer> at the prompt.
-run_setup_answering() {
-  local answer="$1"
-  shift
-  : >"$MOCK/calls.log"
-  OUTPUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" "$@" 2>&1 <<<"$answer")
   STATUS=$?
 }
 
@@ -271,13 +258,10 @@ test_first_run() {
   assert_call "curl POST https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations auth=[Authorization: Bearer $TOKEN] data=[{\"project_id\": \"pool-proj\", \"project_number\": \"111111111111\", \"service_account_email\": \"$SA\", \"provider_id\": \"$PROVIDER\"}]"
   assert_output "AI SRE setup complete!"
   assert_output "Identity pool:    betterstack-ai-sre-pool"
-  refute_output "Already registered"
   assert_output "To remove AI SRE's access from this project later:"
   assert_output "curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre.sh | bash -s -- --ai-sre-remove $PROVIDER --project pool-proj"
   refute_output "$TOKEN"
 }
-
-
 
 test_project_is_required() {
   start_case project_required
@@ -355,7 +339,6 @@ test_another_integration_in_the_same_project() {
   assert_output "Reusing existing service account."
 }
 
-
 test_remove_last_provider() {
   start_case remove_last
   echo ACTIVE >"$MOCK/state/pool"
@@ -399,11 +382,24 @@ test_remove_again_completes_the_removal() {
   refute_call "providers delete"
   assert_output "Provider $PROVIDER is already removed."
   assert_call_count "remove-iam-policy-binding" 8
-  refute_call "service-accounts delete"
+  assert_call "service-accounts delete $SA"
+  assert_output "Already deleted."
   assert_output "AI SRE access removed from pool-proj."
 }
 
-test_remove_stops_when_the_provider_is_still_there() {
+# Without the pool there is no other provider: the roles and the service account go.
+test_remove_without_the_pool() {
+  start_case remove_no_pool
+  touch "$MOCK/state/sa-$SA"
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 0
+  assert_output "Provider $PROVIDER is already removed."
+  assert_call_count "remove-iam-policy-binding" 8
+  check "the service account is still there" not test -f "$MOCK/state/sa-$SA"
+  assert_output "AI SRE access removed from pool-proj."
+}
+
+test_remove_stops_when_the_provider_cannot_be_checked() {
   start_case remove_describe_fails
   echo ACTIVE >"$MOCK/state/pool"
   touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
@@ -411,26 +407,55 @@ test_remove_stops_when_the_provider_is_still_there() {
   export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.providers.describe) UNAVAILABLE: try again"
   run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
   assert_status 1
-  assert_output "Provider $PROVIDER is still in betterstack-ai-sre-pool"
+  assert_output "Error: Checking provider $PROVIDER failed."
+  assert_output "UNAVAILABLE: try again"
+  refute_call "providers delete"
   refute_call "remove-iam-policy-binding"
   refute_call "service-accounts delete"
 }
 
-test_remove_reports_an_unchecked_service_account() {
-  start_case remove_sa_unchecked
+# Without the list it can't tell whether another integration still uses the service account.
+test_remove_stops_when_the_providers_cannot_be_listed() {
+  start_case remove_list_denied
   echo ACTIVE >"$MOCK/state/pool"
   touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
-  export MOCK_FAIL_PATTERN="service-accounts describe $SA"
-  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)."
+  export MOCK_FAIL_PATTERN="providers list"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.providers.list) PERMISSION_DENIED: Permission 'iam.workloadIdentityPoolProviders.list' denied on resource (or it may not exist)."
   run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
   assert_status 1
   assert_call "providers delete $PROVIDER"
-  assert_call_count "remove-iam-policy-binding" 8
+  assert_output "Missing permission: iam.workloadIdentityPoolProviders.list"
+  refute_call "remove-iam-policy-binding"
   refute_call "service-accounts delete"
+}
+
+test_remove_service_account_permission_error() {
+  start_case remove_sa_denied
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="service-accounts delete $SA"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.delete) PERMISSION_DENIED: Permission 'iam.serviceAccounts.delete' denied on resource (or it may not exist)."
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 1
+  assert_call_count "remove-iam-policy-binding" 8
+  assert_output "Missing permission: iam.serviceAccounts.delete"
+  assert_output "needs roles/iam.serviceAccountAdmin on project pool-proj"
   refute_output "Already deleted."
   refute_output "AI SRE access removed"
-  assert_output "Could not check service account $SA, so it was not deleted."
-  assert_output "PERMISSION_DENIED"
+}
+
+# A role removal that fails for any other reason than a missing binding stops the removal.
+test_remove_role_permission_error() {
+  start_case remove_role_denied
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="remove-iam-policy-binding"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.projects.remove-iam-policy-binding) PERMISSION_DENIED: Permission 'resourcemanager.projects.setIamPolicy' denied on resource '//cloudresourcemanager.googleapis.com/projects/pool-proj' (or it may not exist)."
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 1
+  assert_call_count "remove-iam-policy-binding" 1
+  assert_output "needs roles/resourcemanager.projectIamAdmin on project pool-proj"
+  refute_call "service-accounts delete"
 }
 
 test_remove_permission_error() {
@@ -572,6 +597,44 @@ test_permission_error() {
   assert_status 1
   assert_output "Missing permission: iam.serviceAccounts.create"
   assert_output "needs roles/iam.serviceAccountAdmin on project pool-proj"
+}
+
+# A check that fails for any other reason than "not found" stops the setup, instead of
+# reading as "doesn't exist" and trying to create what is already there.
+test_failed_checks_stop_the_setup() {
+  start_case check_pool_denied
+  echo ACTIVE >"$MOCK/state/pool"
+  export MOCK_FAIL_PATTERN="workload-identity-pools describe"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.describe) PERMISSION_DENIED: Permission 'iam.workloadIdentityPools.get' denied on resource (or it may not exist)."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "Error: Checking pool betterstack-ai-sre-pool failed: permission denied."
+  assert_output "Missing permission: iam.workloadIdentityPools.get"
+  assert_output "needs roles/iam.workloadIdentityPoolAdmin on project pool-proj"
+  refute_call "workload-identity-pools create"
+  refute_call "curl POST"
+
+  start_case check_provider_unavailable
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER"
+  export MOCK_FAIL_PATTERN="providers describe"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.providers.describe) UNAVAILABLE: The service is currently unavailable."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "Error: Checking provider $PROVIDER failed."
+  assert_output "UNAVAILABLE: The service is currently unavailable."
+  assert_output "run the same command again"
+  refute_call "providers create-oidc"
+  refute_call "providers update-oidc"
+
+  start_case check_sa_denied
+  touch "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="service-accounts describe"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "Missing permission: iam.serviceAccounts.get"
+  refute_call "service-accounts create"
 }
 
 test_retryable_registration_then_success() {
@@ -737,25 +800,9 @@ test_registered_integration_reruns() {
   audience_response 200 "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"pool-proj\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": \"pool-proj\", \"pool_project_number\": \"111111111111\", \"service_account_email\": \"$SA\", \"project_ids\": [\"pool-proj\"]}"
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 0
-  assert_output "Already registered: pool-proj"
   assert_call "providers create-oidc $PROVIDER --workload-identity-pool=betterstack-ai-sre-pool"
   assert_call "curl POST"
   assert_output "AI SRE setup complete!"
-
-  # Better Stack naming another project's pool or service account stops before any change.
-  start_case registered_elsewhere
-  audience_response 200 "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"pool-proj\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": \"other-proj\", \"pool_project_number\": \"222222222222\", \"service_account_email\": \"betterstack-ai-sre@other-proj.iam.gserviceaccount.com\", \"project_ids\": [\"other-proj\"]}"
-  run_setup --ai-sre "$TOKEN" --project pool-proj
-  assert_status 1
-  assert_output "unexpected project or service account"
-  refute_call "gcloud"
-
-  start_case registered_number_changed
-  audience_response 200 "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"pool-proj\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": \"pool-proj\", \"pool_project_number\": \"333333333333\", \"service_account_email\": \"$SA\", \"project_ids\": [\"pool-proj\"]}"
-  run_setup --ai-sre "$TOKEN" --project pool-proj
-  assert_status 1
-  assert_output "now has number 111111111111, but Better Stack registered 333333333333"
-  refute_call "workload-identity-pools"
 }
 
 # The script never reads or changes the log and metrics ingestion setup's resources.
@@ -876,13 +923,6 @@ test_audience_charset() {
     refute_call "gcloud"
   done
 }
-
-
-
-
-
-
-
 
 # --- Run ---
 

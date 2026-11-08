@@ -119,10 +119,16 @@ ai_sre_gcloud_failed() {
   exit 1
 }
 
-# ai_sre_gcloud <what> <role needed> <gcloud args...>
+# ai_sre_gcloud [--missing-ok] <what> <role needed> <gcloud args...>
 # Runs gcloud with its output in AI_SRE_OUT, and exits with an explanation if it fails.
+# With --missing-ok, a missing resource or binding returns 1 (AI_SRE_OUT empty) instead.
 ai_sre_gcloud() {
-  local what="$1" role="$2" attempt status
+  local missing_ok=false what role attempt status
+  if [ "$1" = "--missing-ok" ]; then
+    missing_ok=true
+    shift
+  fi
+  what="$1" role="$2"
   shift 2
   if [ "$DRY_RUN" = true ]; then
     ai_sre_show gcloud "$@"
@@ -133,6 +139,10 @@ ai_sre_gcloud() {
     status=0
     AI_SRE_OUT=$(gcloud "$@" 2>"$AI_SRE_TMP/gcloud.err") || status=$?
     [ "$status" -eq 0 ] && return 0
+    if [ "$missing_ok" = true ] && grep -qE "NOT_FOUND|not found!" "$AI_SRE_TMP/gcloud.err"; then
+      AI_SRE_OUT=""
+      return 1
+    fi
     # A service account created a moment ago can take up to a minute to reach IAM.
     if [ "$attempt" -lt 12 ] && grep -qiE "service ?account .*does not exist" "$AI_SRE_TMP/gcloud.err"; then
       sleep 5
@@ -143,15 +153,11 @@ ai_sre_gcloud() {
   ai_sre_gcloud_failed "$what" "$role" "$(cat "$AI_SRE_TMP/gcloud.err")${AI_SRE_OUT:+$'\n'$AI_SRE_OUT}"
 }
 
-# ai_sre_probe <gcloud args...>
-# Runs a read-only describe call. AI_SRE_OUT holds its output, or nothing if it failed.
+# ai_sre_probe <what> <role needed> <gcloud args...>
+# Runs a read-only call. AI_SRE_OUT holds its output, or nothing if the resource doesn't
+# exist. Any other failure (a denied permission, an outage) stops the script.
 ai_sre_probe() {
-  if [ "$DRY_RUN" = true ]; then
-    ai_sre_show gcloud "$@"
-    AI_SRE_OUT=""
-    return 0
-  fi
-  AI_SRE_OUT=$(gcloud "$@" 2>/dev/null) || AI_SRE_OUT=""
+  ai_sre_gcloud --missing-ok "$@" || true
 }
 
 # ai_sre_api <method> <path> [json body]
@@ -241,10 +247,7 @@ ai_sre_fetch_audience() {
   if [ "$DRY_RUN" = true ]; then
     AI_SRE_AUDIENCE="AUDIENCE_FROM_BETTER_STACK"
     AI_SRE_PROVIDER="${AI_SRE_PROVIDER_PREFIX}XXXXXXXX"
-    AI_SRE_KNOWN_POOL_PROJECT=""
-    AI_SRE_KNOWN_POOL_NUMBER=""
-    AI_SRE_KNOWN_SA=""
-    echo "  Dry run: assuming the integration has no project yet."
+    echo "  Dry run: using placeholders for the audience and the provider."
     echo ""
     return 0
   fi
@@ -255,9 +258,6 @@ ai_sre_fetch_audience() {
   esac
 
   AI_SRE_AUDIENCE=$(ai_sre_json audience)
-  AI_SRE_KNOWN_POOL_PROJECT=$(ai_sre_json pool_project_id)
-  AI_SRE_KNOWN_POOL_NUMBER=$(ai_sre_json pool_project_number)
-  AI_SRE_KNOWN_SA=$(ai_sre_json service_account_email)
   local caller
   caller=$(ai_sre_json caller_service_account)
 
@@ -285,17 +285,8 @@ ai_sre_fetch_audience() {
   if [ "$project_id" != "$AI_SRE_PROJECT" ]; then
     ai_sre_error "This command is for project ${project_id:-(none)}. Copy the command from the integration in Better Stack again."
   fi
-  # An integration registered before (a rerun after it expired) holds this same project.
-  if [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ]; then
-    if [ "$AI_SRE_KNOWN_POOL_PROJECT" != "$AI_SRE_PROJECT" ] \
-      || [ "$AI_SRE_KNOWN_SA" != "${AI_SRE_SA_NAME}@${AI_SRE_PROJECT}.iam.gserviceaccount.com" ] \
-      || ! [[ "$AI_SRE_KNOWN_POOL_NUMBER" =~ ^[0-9]+$ ]]; then
-      ai_sre_error "Better Stack returned an unexpected project or service account for this integration."
-    fi
-  fi
   echo "  Audience: $AI_SRE_AUDIENCE"
   echo "  Provider: $AI_SRE_PROVIDER"
-  [ -n "$AI_SRE_KNOWN_POOL_PROJECT" ] && echo "  Already registered: ${AI_SRE_PROJECT} (restoring its access)"
   echo ""
 }
 
@@ -324,7 +315,7 @@ ai_sre_enable_apis() {
 ai_sre_ensure_pool() {
   local role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
   echo "Setting up workload identity pool ${AI_SRE_POOL}..."
-  ai_sre_probe iam workload-identity-pools describe "$AI_SRE_POOL" \
+  ai_sre_probe "Checking pool ${AI_SRE_POOL}" "$role" iam workload-identity-pools describe "$AI_SRE_POOL" \
     --location=global --project="$AI_SRE_PROJECT" --format='value(state,disabled)'
   case "$AI_SRE_OUT" in
     ACTIVE*True*)
@@ -356,7 +347,8 @@ ai_sre_ensure_provider() {
     --attribute-condition="assertion.email=='${AI_SRE_CALLER}'"
   )
   echo "Setting up identity provider ${AI_SRE_PROVIDER} (accepts only ${AI_SRE_CALLER})..."
-  ai_sre_probe iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
+  ai_sre_probe "Checking provider ${AI_SRE_PROVIDER}" "$role" \
+    iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
     --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
   AI_SRE_OUT=$(tr -d '[:space:]' <<<"$AI_SRE_OUT")
   if [ "$AI_SRE_OUT" = "DELETED" ]; then
@@ -378,13 +370,15 @@ ai_sre_ensure_provider() {
 }
 
 ai_sre_ensure_service_account() {
+  local role="roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}"
   echo "Setting up service account ${AI_SRE_SA}..."
-  ai_sre_probe iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
+  ai_sre_probe "Checking service account ${AI_SRE_SA}" "$role" \
+    iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
   if [ -n "$AI_SRE_OUT" ]; then
     echo "  Reusing existing service account."
     return 0
   fi
-  ai_sre_gcloud "Creating service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+  ai_sre_gcloud "Creating service account ${AI_SRE_SA}" "$role" \
     iam service-accounts create "$AI_SRE_SA_NAME" --project="$AI_SRE_PROJECT" \
     --display-name="Better Stack AI SRE" --description="Read-only access for Better Stack AI SRE"
 }
@@ -504,6 +498,13 @@ ai_sre_register() {
   done
 }
 
+# Creates the script's private working directory, removed on exit.
+ai_sre_make_tmp() {
+  AI_SRE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-sre.XXXXXX")
+  # shellcheck disable=SC2064 # expand the path now
+  trap "rm -rf '$AI_SRE_TMP'" EXIT
+}
+
 # Sets AI_SRE_PROJECT from --project, which is required.
 ai_sre_require_project() {
   AI_SRE_PROJECT="${PROJECT:-}"
@@ -531,9 +532,7 @@ ai_sre_main() {
     command -v curl >/dev/null || ai_sre_error "curl is required."
   fi
 
-  AI_SRE_TMP=$(mktemp -d)
-  # shellcheck disable=SC2064 # expand the path now
-  trap "rm -rf '$AI_SRE_TMP'" EXIT
+  ai_sre_make_tmp
   printf 'Authorization: Bearer %s\n' "$AI_SRE_TOKEN" >"$AI_SRE_TMP/auth-header"
 
   echo "Better Stack AI SRE Setup"
@@ -556,10 +555,6 @@ ai_sre_main() {
   echo ""
 
   ai_sre_project_number
-  if [ -n "$AI_SRE_KNOWN_POOL_NUMBER" ] && [ "$AI_SRE_KNOWN_POOL_NUMBER" != "$AI_SRE_PROJECT_NUMBER" ]; then
-    ai_sre_error "Project ${AI_SRE_PROJECT} now has number ${AI_SRE_PROJECT_NUMBER}, but Better Stack registered ${AI_SRE_KNOWN_POOL_NUMBER}."
-  fi
-
   ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS[@]}"
   ai_sre_ensure_pool
   ai_sre_ensure_provider
@@ -591,7 +586,7 @@ ai_sre_main() {
 # --- AI SRE removal (--ai-sre-remove) ---
 
 ai_sre_remove_main() {
-  local role pool_role list_role name others=0 still_there=false sa_state
+  local role pool_role name others=0
   if [ "$AI_SRE" = true ]; then
     ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
   fi
@@ -605,13 +600,10 @@ ai_sre_remove_main() {
   if [ "$DRY_RUN" = false ]; then
     command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
   fi
-  AI_SRE_TMP=$(mktemp -d)
-  # shellcheck disable=SC2064 # expand the path now
-  trap "rm -rf '$AI_SRE_TMP'" EXIT
+  ai_sre_make_tmp
   AI_SRE_PROVIDER="$AI_SRE_REMOVE_PROVIDER"
   AI_SRE_SA="${AI_SRE_SA_NAME}@${AI_SRE_PROJECT}.iam.gserviceaccount.com"
   pool_role="roles/iam.workloadIdentityPoolAdmin on project ${AI_SRE_PROJECT}"
-  list_role="roles/iam.workloadIdentityPoolViewer on project ${AI_SRE_PROJECT}"
 
   echo "Better Stack AI SRE Removal"
   echo "==========================="
@@ -622,7 +614,8 @@ ai_sre_remove_main() {
   fi
 
   echo "Removing provider ${AI_SRE_PROVIDER} from ${AI_SRE_POOL} in ${AI_SRE_PROJECT}..."
-  ai_sre_probe iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
+  ai_sre_probe "Checking provider ${AI_SRE_PROVIDER}" "$pool_role" \
+    iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
     --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
   if [ "$DRY_RUN" = true ] || [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ]; then
     ai_sre_gcloud "Deleting provider ${AI_SRE_PROVIDER}" "$pool_role" \
@@ -635,71 +628,29 @@ ai_sre_remove_main() {
 
   # The service account and its roles go only with the last AI SRE provider.
   echo "Checking for other Better Stack AI SRE providers..."
-  if [ "$DRY_RUN" = true ]; then
-    ai_sre_show gcloud iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
-      --location=global --project="$AI_SRE_PROJECT" --format='value(name)'
-  elif AI_SRE_OUT=$(gcloud iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
-    --location=global --project="$AI_SRE_PROJECT" --format='value(name)' 2>"$AI_SRE_TMP/gcloud.err"); then
-    while IFS= read -r name; do
-      name="${name##*/}"
-      if [ "$name" = "$AI_SRE_PROVIDER" ]; then
-        still_there=true
-      elif [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
-        others=$((others + 1))
-      fi
-    done <<<"$AI_SRE_OUT"
-    if [ "$still_there" = true ]; then
-      ai_sre_error "Provider ${AI_SRE_PROVIDER} is still in ${AI_SRE_POOL}: gcloud could not describe or delete it. Run the same command again."
+  ai_sre_probe "Listing the providers in ${AI_SRE_POOL}" "$pool_role" \
+    iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
+    --location=global --project="$AI_SRE_PROJECT" --format='value(name)'
+  while IFS= read -r name; do
+    name="${name##*/}"
+    if [ "$name" != "$AI_SRE_PROVIDER" ] && [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
+      others=$((others + 1))
     fi
-  elif ! grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
-    ai_sre_gcloud_failed "Listing the providers in ${AI_SRE_POOL}" "$list_role" "$(cat "$AI_SRE_TMP/gcloud.err")"
-  fi
+  done <<<"$AI_SRE_OUT"
   if [ "$others" -gt 0 ]; then
     echo "  Kept ${AI_SRE_SA} and its roles: ${others} other Better Stack AI SRE integration$([ "$others" -gt 1 ] && echo "s") in this project still $([ "$others" -gt 1 ] && echo "use" || echo "uses") them."
   else
     echo "Removing the roles of ${AI_SRE_SA}..."
     for role in "${AI_SRE_ROLES[@]}"; do
       echo "  $role"
-      if [ "$DRY_RUN" = true ]; then
-        ai_sre_show gcloud projects remove-iam-policy-binding "$AI_SRE_PROJECT" \
-          --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet
-      elif ! gcloud projects remove-iam-policy-binding "$AI_SRE_PROJECT" \
-        --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet \
-        >/dev/null 2>"$AI_SRE_TMP/gcloud.err"; then
-        # A binding that is already gone is fine.
-        grep -qi "not found" "$AI_SRE_TMP/gcloud.err" || ai_sre_gcloud_failed "Removing ${role}" \
-          "roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}" "$(cat "$AI_SRE_TMP/gcloud.err")"
-      fi
+      # A binding that is already gone is fine.
+      ai_sre_gcloud --missing-ok "Removing ${role}" "roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}" \
+        projects remove-iam-policy-binding "$AI_SRE_PROJECT" \
+        --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet || true
     done
     echo "Deleting service account ${AI_SRE_SA}..."
-    if [ "$DRY_RUN" = true ]; then
-      ai_sre_show gcloud iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
-      sa_state=present
-    elif gcloud iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)' \
-      >/dev/null 2>"$AI_SRE_TMP/gcloud.err"; then
-      sa_state=present
-    elif grep -q "NOT_FOUND" "$AI_SRE_TMP/gcloud.err"; then
-      sa_state=deleted
-    else
-      sa_state=unknown
-    fi
-    case "$sa_state" in
-      present)
-        ai_sre_gcloud "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
-          iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet
-        ;;
-      deleted) echo "  Already deleted." ;;
-      unknown)
-        echo ""
-        echo "Error: Could not check service account ${AI_SRE_SA}, so it was not deleted."
-        echo "  The provider and the service account's roles are removed."
-        echo ""
-        echo "  gcloud said:"
-        sed 's/^/    /' "$AI_SRE_TMP/gcloud.err"
-        ai_sre_rerun_hint
-        exit 1
-        ;;
-    esac
+    ai_sre_gcloud --missing-ok "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
+      iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet || echo "  Already deleted."
   fi
 
   echo ""
