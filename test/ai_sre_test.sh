@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Tests for ai-sre.sh, with gcloud, curl and sleep replaced by mocks on PATH.
+# Tests for ai-sre-setup.sh, with gcloud, curl and sleep replaced by mocks on PATH.
 # Nothing here calls Google or Better Stack.
 #
 # Usage: test/ai_sre_test.sh
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$ROOT/ai-sre.sh"
+SCRIPT="$ROOT/ai-sre-setup.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ai-sre-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -193,7 +193,7 @@ audience_response() { echo "$1 $2" >"$MOCK/audience.response"; }
 audience_responses() { printf '%s\n' "$@" >"$MOCK/audience.response"; }
 post_responses() { printf '%s\n' "$@" >"$MOCK/post.responses"; }
 
-# run_setup <args...>: runs ai-sre.sh with the mocks; sets OUTPUT and STATUS.
+# run_setup <args...>: runs ai-sre-setup.sh with the mocks; sets OUTPUT and STATUS.
 run_setup() {
   : >"$MOCK/calls.log"
   OUTPUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" "$@" 2>&1 </dev/null)
@@ -259,7 +259,7 @@ test_first_run() {
   assert_output "AI SRE setup complete!"
   assert_output "Identity pool:    betterstack-ai-sre-pool"
   assert_output "To remove AI SRE's access from this project later:"
-  assert_output "curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre.sh | bash -s -- --ai-sre-remove $PROVIDER --project pool-proj"
+  assert_output "curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh | bash -s -- --ai-sre-remove $PROVIDER --project pool-proj"
   refute_output "$TOKEN"
 }
 

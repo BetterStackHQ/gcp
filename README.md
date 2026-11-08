@@ -7,7 +7,7 @@ This repository contains setup scripts and Terraform modules for integrating you
 | Directory | Description |
 |-----------|-------------|
 | [setup.sh](setup.sh) | Bash setup script for quick deployment |
-| [ai-sre.sh](ai-sre.sh) | Bash setup script for Better Stack AI SRE's read-only access ([AI SRE](#ai-sre)) |
+| [ai-sre-setup.sh](ai-sre-setup.sh) | Bash setup script for Better Stack AI SRE's read-only access ([AI SRE](#ai-sre)) |
 | [terraform/](terraform/README.md) | Terraform module for infrastructure-as-code deployment |
 
 ## Getting Started
@@ -62,10 +62,10 @@ The fastest way to deploy. Requires the [gcloud CLI](https://cloud.google.com/sd
 
 ## AI SRE
 
-`ai-sre.sh` gives [Better Stack AI SRE](https://betterstack.com) read-only access to a project through Google's MCP servers. Create a GCP integration in Better Stack for the project, then run the command it shows, for example in Cloud Shell. It is separate from `setup.sh` and never touches the log and metrics ingestion setup:
+`ai-sre-setup.sh` gives [Better Stack AI SRE](https://betterstack.com) read-only access to a project through Google's MCP servers. Create a GCP integration in Better Stack for the project, then run the command it shows, for example in Cloud Shell. It is separate from `setup.sh` and never touches the log and metrics ingestion setup:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre.sh | bash -s -- --ai-sre YOUR_TOKEN --project my-project
+curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh | bash -s -- --ai-sre YOUR_TOKEN --project my-project
 ```
 
 The token works once. Each integration connects one project, and the command only works for the project it was created for. To connect another project, add another integration. Several integrations, from one or more Better Stack teams, can connect the same project.
@@ -121,7 +121,7 @@ Every step checks what already exists, so after any failure, fix the cause and r
 A successful setup ends by printing the command that removes the integration's access:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh | bash -s -- \
   --ai-sre-remove betterstack-ai-sre-<8 hex> --project my-project
 ```
 
@@ -158,11 +158,11 @@ The user running the setup needs:
 
 ## Tests
 
-`test/ai_sre_test.sh` runs `ai-sre.sh` against mocked `gcloud` and `curl` commands, so it needs no GCP project or Better Stack account (only `bash` and `python3`):
+`test/ai_sre_test.sh` runs `ai-sre-setup.sh` against mocked `gcloud` and `curl` commands, so it needs no GCP project or Better Stack account (only `bash` and `python3`):
 
 ```bash
 test/ai_sre_test.sh
-shellcheck ai-sre.sh test/ai_sre_test.sh
+shellcheck ai-sre-setup.sh test/ai_sre_test.sh
 ```
 
 ## Log Filter Management

@@ -38,7 +38,7 @@ AI_SRE_POOL="betterstack-ai-sre-pool"
 AI_SRE_PROVIDER_PREFIX="betterstack-ai-sre-"
 AI_SRE_PROVIDER=""
 AI_SRE_PROVIDER_CREATED=false
-AI_SRE_SCRIPT_URL="https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre.sh"
+AI_SRE_SCRIPT_URL="https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh"
 AI_SRE_SA_NAME="betterstack-ai-sre"
 # Read-only roles for the MCP servers: Logging, Monitoring, Cloud Run, Resource
 # Manager, Cloud Trace, Error Reporting and Kubernetes Engine.
