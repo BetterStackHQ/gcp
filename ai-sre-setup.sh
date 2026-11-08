@@ -57,6 +57,10 @@ AI_SRE_POOL_APIS=(iam iamcredentials sts)
 AI_SRE_REGISTER_TIMEOUT=180
 AI_SRE_OUT=""
 AI_SRE_STATUS=""
+# A line ai_sre_gcloud_failed adds to its explanation, for the call that sets it.
+AI_SRE_FAIL_NOTE=""
+# Whether this run has started changing the project (so a failure can point at --ai-sre-remove).
+AI_SRE_CHANGED=false
 
 # Whether a value is one of this script's own options (so --ai-sre got no token).
 ai_sre_is_option() {
@@ -110,6 +114,7 @@ ai_sre_gcloud_failed() {
   else
     echo "Error: ${what} failed."
   fi
+  [ -n "$AI_SRE_FAIL_NOTE" ] && echo "  $AI_SRE_FAIL_NOTE"
   echo ""
   echo "  gcloud said:"
   while IFS= read -r line; do
@@ -217,7 +222,17 @@ ai_sre_token_rejected() {
   echo "Error: Better Stack rejected the registration token ($(ai_sre_api_error))."
   echo "  A token works once. If the integration in Better Stack is already active, the setup is complete."
   echo "  If it isn't, copy the command from the integration in Better Stack again and run it."
+  if [ "$AI_SRE_CHANGED" = true ]; then
+    echo "  If the integration was removed from Better Stack, undo what this command set up in ${AI_SRE_PROJECT}:"
+    echo "    $(ai_sre_remove_command)"
+  fi
   exit 1
+}
+
+# ai_sre_remove_command [provider]: the command that removes a provider (this integration's by
+# default) and, with the last one, the service account.
+ai_sre_remove_command() {
+  echo "curl -fsSL ${AI_SRE_SCRIPT_URL} | bash -s -- --ai-sre-remove ${1:-$AI_SRE_PROVIDER} --project ${AI_SRE_PROJECT}"
 }
 
 # ai_sre_retry_wait <what>: waits before retrying a Better Stack call, backing off
@@ -283,7 +298,7 @@ ai_sre_fetch_audience() {
   # Nothing has changed yet: refuse a project other than the integration's.
   project_id=$(ai_sre_json project_id)
   if [ "$project_id" != "$AI_SRE_PROJECT" ]; then
-    ai_sre_error "This command is for project ${project_id:-(none)}. Copy the command from the integration in Better Stack again."
+    ai_sre_error "This command is for project ${project_id:-(none)}, not ${AI_SRE_PROJECT}. To connect ${AI_SRE_PROJECT}, add a Google Cloud integration for it in Better Stack."
   fi
   echo "  Audience: $AI_SRE_AUDIENCE"
   echo "  Provider: $AI_SRE_PROVIDER"
@@ -292,8 +307,11 @@ ai_sre_fetch_audience() {
 
 ai_sre_project_number() {
   echo "Reading project ${AI_SRE_PROJECT}..."
+  # Google answers the same for a project that doesn't exist and one the caller can't read.
+  AI_SRE_FAIL_NOTE="If ${AI_SRE_PROJECT} isn't the right project ID: this command works only for it. To connect another project, add a Google Cloud integration for it in Better Stack."
   ai_sre_gcloud "Reading project ${AI_SRE_PROJECT}" "roles/browser on project ${AI_SRE_PROJECT}" \
     projects describe "$AI_SRE_PROJECT" --format='value(projectNumber)'
+  AI_SRE_FAIL_NOTE=""
   if [ "$DRY_RUN" = true ]; then
     AI_SRE_PROJECT_NUMBER="PROJECT_NUMBER"
     return 0
@@ -369,12 +387,19 @@ ai_sre_ensure_provider() {
   fi
 }
 
+# ai_sre_service_account_exists <role needed>: whether the AI SRE service account exists.
+# Listed, not described: for weeks after a service account is deleted, Google answers describe
+# and delete on its email with PERMISSION_DENIED, not NOT_FOUND, but no longer lists it.
+ai_sre_service_account_exists() {
+  ai_sre_gcloud "Checking service account ${AI_SRE_SA}" "$1" \
+    iam service-accounts list --project="$AI_SRE_PROJECT" --filter="email=${AI_SRE_SA}" --format='value(email)'
+  [ -n "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" ]
+}
+
 ai_sre_ensure_service_account() {
   local role="roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}"
   echo "Setting up service account ${AI_SRE_SA}..."
-  ai_sre_probe "Checking service account ${AI_SRE_SA}" "$role" \
-    iam service-accounts describe "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --format='value(email)'
-  if [ -n "$AI_SRE_OUT" ]; then
+  if ai_sre_service_account_exists "$role"; then
     echo "  Reusing existing service account."
     return 0
   fi
@@ -493,6 +518,8 @@ ai_sre_register() {
       echo "Error: Better Stack could not use the new access after ${AI_SRE_WAITED} seconds ($(ai_sre_api_error))."
       echo "  Google can take several minutes to apply IAM changes."
       ai_sre_rerun_hint
+      echo "To undo what this command set up in ${AI_SRE_PROJECT} instead:"
+      echo "  $(ai_sre_remove_command)"
       exit 1
     fi
   done
@@ -555,6 +582,7 @@ ai_sre_main() {
   echo ""
 
   ai_sre_project_number
+  AI_SRE_CHANGED=true
   ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS[@]}"
   ai_sre_ensure_pool
   ai_sre_ensure_provider
@@ -580,13 +608,13 @@ ai_sre_main() {
   echo "The integration is now active in Better Stack."
   echo ""
   echo "To remove AI SRE's access from this project later:"
-  echo "  curl -fsSL ${AI_SRE_SCRIPT_URL} | bash -s -- --ai-sre-remove ${AI_SRE_PROVIDER} --project ${AI_SRE_PROJECT}"
+  echo "  $(ai_sre_remove_command)"
 }
 
 # --- AI SRE removal (--ai-sre-remove) ---
 
 ai_sre_remove_main() {
-  local role pool_role name others=0
+  local role pool_role sa_role name others=()
   if [ "$AI_SRE" = true ]; then
     ai_sre_error "--ai-sre and --ai-sre-remove can't be combined."
   fi
@@ -621,7 +649,7 @@ ai_sre_remove_main() {
     ai_sre_gcloud "Deleting provider ${AI_SRE_PROVIDER}" "$pool_role" \
       iam workload-identity-pools providers delete "$AI_SRE_PROVIDER" \
       --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet
-    echo "  Deleted provider ${AI_SRE_PROVIDER}."
+    [ "$DRY_RUN" = true ] || echo "  Deleted provider ${AI_SRE_PROVIDER}."
   else
     echo "  Provider ${AI_SRE_PROVIDER} is already removed."
   fi
@@ -634,11 +662,19 @@ ai_sre_remove_main() {
   while IFS= read -r name; do
     name="${name##*/}"
     if [ "$name" != "$AI_SRE_PROVIDER" ] && [[ "$name" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
-      others=$((others + 1))
+      others+=("$name")
     fi
   done <<<"$AI_SRE_OUT"
-  if [ "$others" -gt 0 ]; then
-    echo "  Kept ${AI_SRE_SA} and its roles: ${others} other Better Stack AI SRE integration$([ "$others" -gt 1 ] && echo "s") in this project still $([ "$others" -gt 1 ] && echo "use" || echo "uses") them."
+  if [ "${#others[@]}" -gt 0 ]; then
+    # This script can't tell whether their integrations still exist in Better Stack: name them.
+    echo "  Kept ${AI_SRE_SA} and its roles: these AI SRE providers in ${AI_SRE_PROJECT} still use them:"
+    for name in "${others[@]}"; do
+      echo "    ${name}"
+    done
+    echo "  Each belongs to a Google Cloud integration in Better Stack. If that integration was removed, remove its provider too:"
+    for name in "${others[@]}"; do
+      echo "    $(ai_sre_remove_command "$name")"
+    done
   else
     echo "Removing the roles of ${AI_SRE_SA}..."
     for role in "${AI_SRE_ROLES[@]}"; do
@@ -649,13 +685,22 @@ ai_sre_remove_main() {
         --member="serviceAccount:${AI_SRE_SA}" --role="$role" --condition=None --quiet || true
     done
     echo "Deleting service account ${AI_SRE_SA}..."
-    ai_sre_gcloud --missing-ok "Deleting service account ${AI_SRE_SA}" "roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}" \
-      iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet || echo "  Already deleted."
+    sa_role="roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}"
+    if ai_sre_service_account_exists "$sa_role" || [ "$DRY_RUN" = true ]; then
+      ai_sre_gcloud --missing-ok "Deleting service account ${AI_SRE_SA}" "$sa_role" \
+        iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet || echo "  Already deleted."
+    else
+      echo "  Already deleted."
+    fi
   fi
 
   echo ""
   if [ "$DRY_RUN" = true ]; then
     echo "Dry run complete: nothing was changed."
+    return 0
+  fi
+  if [ "${#others[@]}" -gt 0 ]; then
+    echo "Removed provider ${AI_SRE_PROVIDER} from ${AI_SRE_PROJECT}. AI SRE can still reach ${AI_SRE_PROJECT} through the providers listed above."
     return 0
   fi
   echo "AI SRE access removed from ${AI_SRE_PROJECT}."

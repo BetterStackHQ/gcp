@@ -85,16 +85,27 @@ case "$ARGS" in
     [ -f "$S/provider-$5" ] && { echo "ERROR: ALREADY_EXISTS" >&2; exit 1; }
     echo "$ARGS" >"$S/provider-$5"
     ;;
+  # For weeks after a delete, Google answers describe and delete with PERMISSION_DENIED
+  # (MOCK state sa-gone-<email>), but no longer lists the account.
+  "iam service-accounts list "*)
+    email=$(arg_value --filter); email="${email#email=}"
+    [ -f "$S/sa-$email" ] && echo "$email"
+    ;;
   "iam service-accounts describe "*)
+    [ -f "$S/sa-gone-$4" ] && { echo "ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)." >&2; exit 1; }
     [ -f "$S/sa-$4" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
     echo "$4"
     ;;
   "iam service-accounts delete "*)
+    [ -f "$S/sa-gone-$4" ] && { echo "ERROR: (gcloud.iam.service-accounts.delete) PERMISSION_DENIED: Permission 'iam.serviceAccounts.delete' denied on resource (or it may not exist)." >&2; exit 1; }
     [ -f "$S/sa-$4" ] || { echo "ERROR: (gcloud.iam.service-accounts.delete) NOT_FOUND: Service account projects/-/serviceAccounts/$4 does not exist." >&2; exit 1; }
     rm -f "$S/sa-$4"
+    touch "$S/sa-gone-$4"
     ;;
   "iam service-accounts create "*)
-    touch "$S/sa-$4@$(arg_value --project).iam.gserviceaccount.com"
+    email="$4@$(arg_value --project).iam.gserviceaccount.com"
+    touch "$S/sa-$email"
+    rm -f "$S/sa-gone-$email"
     ;;
   "iam service-accounts add-iam-policy-binding "*)
     # MOCK_SA_LAG: how many calls fail before a new service account reaches IAM.
@@ -280,7 +291,8 @@ test_wrong_project_is_refused_before_any_change() {
   start_case wrong_project
   run_setup --ai-sre "$TOKEN" --project other-proj
   assert_status 1
-  assert_output "This command is for project pool-proj."
+  assert_output "This command is for project pool-proj, not other-proj."
+  assert_output "To connect other-proj, add a Google Cloud integration for it in Better Stack."
   assert_call_count "curl" 1
   refute_call "gcloud"
 }
@@ -368,7 +380,12 @@ test_remove_keeps_access_other_integrations_use() {
   refute_call "providers delete betterstack-ai-sre-0a1b2c3d"
   refute_call "remove-iam-policy-binding"
   refute_call "service-accounts delete"
-  assert_output "Kept $SA and its roles: 1 other Better Stack AI SRE integration in this project still uses them."
+  assert_output "Kept $SA and its roles: these AI SRE providers in pool-proj still use them:"
+  assert_output "    betterstack-ai-sre-0a1b2c3d"
+  assert_output "--ai-sre-remove betterstack-ai-sre-0a1b2c3d --project pool-proj"
+  refute_output "AI SRE access removed"
+  refute_output "grants no access without a provider"
+  assert_output "Removed provider $PROVIDER from pool-proj. AI SRE can still reach pool-proj through the providers listed above."
 }
 
 test_remove_again_completes_the_removal() {
@@ -382,8 +399,24 @@ test_remove_again_completes_the_removal() {
   refute_call "providers delete"
   assert_output "Provider $PROVIDER is already removed."
   assert_call_count "remove-iam-policy-binding" 8
-  assert_call "service-accounts delete $SA"
+  assert_call "service-accounts list --project=pool-proj --filter=email=$SA"
+  refute_call "service-accounts delete"
   assert_output "Already deleted."
+  assert_output "AI SRE access removed from pool-proj."
+}
+
+# The service account went with an earlier removal: Google still answers delete and describe with
+# PERMISSION_DENIED for weeks, which must read as "already deleted", not as a missing role.
+test_remove_after_the_service_account_was_deleted() {
+  start_case remove_sa_gone
+  echo ACTIVE >"$MOCK/state/pool"
+  echo DELETED >"$MOCK/state/provider-$PROVIDER"
+  touch "$MOCK/state/sa-gone-$SA"
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 0
+  refute_call "service-accounts delete"
+  assert_output "Already deleted."
+  refute_output "permission denied"
   assert_output "AI SRE access removed from pool-proj."
 }
 
@@ -479,6 +512,7 @@ test_remove_dry_run_and_arguments() {
   assert_output "\$ gcloud iam workload-identity-pools providers delete $PROVIDER"
   assert_output "\$ gcloud projects remove-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=roles/mcp.toolUser"
   assert_output "\$ gcloud iam service-accounts delete $SA"
+  refute_output "Deleted provider"
 
   start_case remove_args
   run_setup --ai-sre-remove betterstack-ai-sre --project pool-proj
@@ -629,12 +663,33 @@ test_failed_checks_stop_the_setup() {
 
   start_case check_sa_denied
   touch "$MOCK/state/sa-$SA"
-  export MOCK_FAIL_PATTERN="service-accounts describe"
-  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)."
+  export MOCK_FAIL_PATTERN="service-accounts list"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.list) PERMISSION_DENIED: Permission 'iam.serviceAccounts.list' denied on resource (or it may not exist)."
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
-  assert_output "Missing permission: iam.serviceAccounts.get"
+  assert_output "Missing permission: iam.serviceAccounts.list"
   refute_call "service-accounts create"
+
+  start_case check_project_denied
+  export MOCK_FAIL_PATTERN="projects describe"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.projects.describe) [me@example.com] does not have permission to access projects instance [pool-proj] (or it may not exist): The caller does not have permission."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "needs roles/browser on project pool-proj"
+  assert_output "If pool-proj isn't the right project ID: this command works only for it. To connect another project, add a Google Cloud integration for it in Better Stack."
+  refute_call "services enable"
+}
+
+# Setting up again after a removal deleted the service account: it's created anew.
+test_setup_after_the_service_account_was_deleted() {
+  start_case setup_sa_gone
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/sa-gone-$SA"
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_call "gcloud iam service-accounts create betterstack-ai-sre --project=pool-proj"
+  refute_output "permission denied"
+  assert_output "AI SRE setup complete!"
 }
 
 test_retryable_registration_then_success() {
@@ -663,6 +718,8 @@ test_retryable_registration_gives_up() {
   assert_call_count "curl POST" 8
   assert_output "Error: Better Stack could not use the new access after 155 seconds (HTTP 422: Could not list tools)"
   assert_output "run the same command again"
+  assert_output "To undo what this command set up in pool-proj instead:"
+  assert_output "--ai-sre-remove $PROVIDER --project pool-proj"
   refute_output "AI SRE setup complete!"
 }
 
@@ -684,6 +741,7 @@ test_rejected_token() {
   assert_output "Better Stack rejected the registration token (HTTP 401: Token is unknown or already used)"
   assert_output "A token works once."
   assert_output "copy the command from the integration in Better Stack again and run it."
+  refute_output "--ai-sre-remove"
   refute_output "24 hours"
   refute_output "expire"
   refute_call "gcloud"
@@ -694,6 +752,8 @@ test_rejected_token() {
   assert_status 1
   assert_call_count "curl POST" 1
   assert_output "Better Stack rejected the registration token"
+  assert_output "If the integration was removed from Better Stack, undo what this command set up in pool-proj:"
+  assert_output "--ai-sre-remove $PROVIDER --project pool-proj"
 
   run_setup --help
   refute_output "expire"
