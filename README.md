@@ -1,6 +1,6 @@
 # Better Stack GCP Integration
 
-This repository holds two independent setups for connecting Google Cloud to Better Stack:
+This repository holds two independent setups for connecting GCP to Better Stack:
 
 - **[Log and metrics ingestion](#log-and-metrics-ingestion)** sends a project's or organization's logs and metrics to Better Stack, with `setup.sh` or the Terraform module.
 - **[AI SRE](#ai-sre)** gives Better Stack AI SRE read-only access to one project, with `ai-sre-setup.sh`.
@@ -101,17 +101,17 @@ settings page.
 
 ## AI SRE
 
-`ai-sre-setup.sh` gives Better Stack AI SRE read-only access to one Google Cloud project. It's separate from the ingestion setup and never changes its resources.
+`ai-sre-setup.sh` gives Better Stack AI SRE read-only access to one GCP project. It's separate from the ingestion setup and never changes its resources.
 
 ### Getting Started
 
-In Better Stack, go to AI SRE → Integrations → Google Cloud and add an integration for your project. Copy the setup command it shows and run it as an owner of the project, for example in [Cloud Shell](https://shell.cloud.google.com):
+In Better Stack, go to AI SRE → Integrations → GCP and add an integration for your project. Copy the setup command it shows and run it as an owner of the project, for example in [Cloud Shell](https://shell.cloud.google.com):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh | bash -s -- --ai-sre YOUR_TOKEN --project my-project
 ```
 
-It takes a few minutes, because Google needs time to apply the new access and the script waits for it. When it finishes, the integration in Better Stack turns **Active**.
+It takes a few minutes, because GCP needs time to apply the new access and the script waits for it. When it finishes, the integration in Better Stack turns **Active**.
 
 If the script stops with an error, fix what it says and run the same command again. It picks up where it stopped.
 
