@@ -309,7 +309,7 @@ ai_sre_fetch_audience() {
   # Nothing has changed yet: refuse a project other than the integration's.
   project_id=$(ai_sre_json project_id)
   if [ "$project_id" != "$AI_SRE_PROJECT" ]; then
-    ai_sre_error "This command is for project ${project_id:-(none)}, not ${AI_SRE_PROJECT}. To connect ${AI_SRE_PROJECT}, add a Google Cloud integration for it in Better Stack."
+    ai_sre_error "This command is for project ${project_id:-(none)}, not ${AI_SRE_PROJECT}. To connect ${AI_SRE_PROJECT}, add a GCP integration for it in Better Stack."
   fi
   echo "  Audience: $AI_SRE_AUDIENCE"
   echo "  Provider: $AI_SRE_PROVIDER"
@@ -319,7 +319,7 @@ ai_sre_fetch_audience() {
 ai_sre_project_number() {
   echo "Reading project ${AI_SRE_PROJECT}..."
   # Google answers the same for a project that doesn't exist and one the caller can't read.
-  AI_SRE_FAIL_NOTE="If ${AI_SRE_PROJECT} isn't the right project ID: this command works only for it. To connect another project, add a Google Cloud integration for it in Better Stack."
+  AI_SRE_FAIL_NOTE="If ${AI_SRE_PROJECT} isn't the right project ID: this command works only for it. To connect another project, add a GCP integration for it in Better Stack."
   ai_sre_gcloud "Reading project ${AI_SRE_PROJECT}" "roles/browser on project ${AI_SRE_PROJECT}" \
     projects describe "$AI_SRE_PROJECT" --format='value(projectNumber)'
   AI_SRE_FAIL_NOTE=""
@@ -475,7 +475,7 @@ ai_sre_register() {
   body=$(python3 -c 'import json, sys; print(json.dumps({"project_id": sys.argv[1], "project_number": sys.argv[2], "service_account_email": sys.argv[3], "provider_id": sys.argv[4]}))' \
     "$AI_SRE_PROJECT" "$AI_SRE_PROJECT_NUMBER" "$AI_SRE_SA" "$AI_SRE_PROVIDER")
   echo "Registering ${AI_SRE_PROJECT} with Better Stack..."
-  echo "  Better Stack checks that it can use the new access. Google can take a few minutes"
+  echo "  Better Stack checks that it can use the new access. GCP can take a few minutes"
   echo "  to apply IAM changes, so this retries for up to $((AI_SRE_REGISTER_TIMEOUT / 60)) minutes."
   AI_SRE_WAITED=0
   AI_SRE_DELAY=5
@@ -515,7 +515,7 @@ ai_sre_register() {
     if ! ai_sre_retry_wait "Not ready yet" "$AI_SRE_REGISTER_TIMEOUT"; then
       echo ""
       echo "Error: Better Stack still can't use the new access after ${AI_SRE_WAITED} seconds ($(ai_sre_api_error))."
-      echo "  Usually Google is still applying the new IAM grants, and nothing needs fixing."
+      echo "  Usually GCP is still applying the new IAM grants, and nothing needs fixing."
       echo "  Run the same command again in a few minutes: the token works until a run succeeds."
       echo "  If it keeps failing with the same message, contact Better Stack at hello@betterstack.com."
       echo ""
@@ -654,7 +654,7 @@ ai_sre_remove_main() {
     for name in "${others[@]}"; do
       echo "    ${name}"
     done
-    echo "  Each belongs to a Google Cloud integration in Better Stack. If that integration was removed, remove its provider too:"
+    echo "  Each belongs to a GCP integration in Better Stack. If that integration was removed, remove its provider too:"
     for name in "${others[@]}"; do
       echo "    $(ai_sre_remove_command "$name")"
     done
@@ -700,7 +700,7 @@ ai_sre_remove_main() {
 
 print_usage() {
   cat <<USAGE
-Better Stack AI SRE Setup for Google Cloud
+Better Stack AI SRE Setup for GCP
 
 Usage:
   ai-sre-setup.sh --ai-sre <token> --project <id> [options]

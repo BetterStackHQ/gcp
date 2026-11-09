@@ -313,7 +313,7 @@ test_wrong_project_is_refused_before_any_change() {
   run_setup --ai-sre "$TOKEN" --project other-proj
   assert_status 1
   assert_output "This command is for project pool-proj, not other-proj."
-  assert_output "To connect other-proj, add a Google Cloud integration for it in Better Stack."
+  assert_output "To connect other-proj, add a GCP integration for it in Better Stack."
   assert_call_count "curl" 1
   refute_call "gcloud"
 }
@@ -739,7 +739,7 @@ test_failed_checks_stop_the_setup() {
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
   assert_output "needs roles/browser on project pool-proj"
-  assert_output "If pool-proj isn't the right project ID: this command works only for it. To connect another project, add a Google Cloud integration for it in Better Stack."
+  assert_output "If pool-proj isn't the right project ID: this command works only for it. To connect another project, add a GCP integration for it in Better Stack."
   refute_call "services enable"
   refute_output "undo"
 }
