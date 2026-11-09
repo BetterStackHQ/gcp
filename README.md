@@ -182,13 +182,14 @@ It can't change anything, with one exception: `roles/cloudtrace.user` can also c
 
 Better Stack's relay offers AI SRE only the MCP tools that Google marks read-only.
 
+**Auditing.** To record what AI SRE reads, turn on Data Access audit logs in IAM & Admin → Audit Logs for the services you want to watch. For example, the IAM Service Account Credentials API logs each token Better Stack gets for `betterstack-ai-sre@`. These logs are billed as Cloud Logging ingestion. This script doesn't change audit log settings.
+
 ### Options
 
 | Argument | Description |
 |----------|-------------|
 | `--ai-sre <token>` | Registration token. It is part of the command Better Stack shows. |
 | `--project <id>` | The project to connect (required). It must be the project the integration was created for. |
-| `--audit-logs` | Turns on Data Access audit logs (`DATA_READ`) for `mcp.googleapis.com`. Off by default, because they are billed as Cloud Logging ingestion. To use it, add it to the end of the command Better Stack shows. |
 | `--api-url <url>` | Better Stack API base URL. The command Better Stack shows sets it when needed, so don't change it. Default: `https://telemetry.betterstack.com`. |
 | `--ai-sre-remove <provider id>` | Removes an integration's access instead of setting it up. See [Removal](#removal). |
 | `--help`, `-h` | Shows usage. |
@@ -204,7 +205,7 @@ The person running the script needs `roles/owner` on the project, or all of thes
 | `roles/serviceusage.serviceUsageAdmin` | List the enabled APIs, and enable whichever of `iam`, `iamcredentials`, `sts` and `logging` is off. When all four are on, `roles/serviceusage.serviceUsageViewer` is enough |
 | `roles/iam.workloadIdentityPoolAdmin` | Create, enable, restore or delete the pool and the provider |
 | `roles/iam.serviceAccountAdmin` | Create, enable or delete the service account, and grant `roles/iam.workloadIdentityUser` on it |
-| `roles/resourcemanager.projectIamAdmin` | Grant or remove the service account's roles on the project, and turn on audit logs |
+| `roles/resourcemanager.projectIamAdmin` | Grant or remove the service account's roles on the project |
 
 Removal doesn't need `roles/serviceusage.serviceUsageAdmin`.
 
@@ -276,8 +277,7 @@ What it does:
 - **When it removes the last provider**, it also removes the service account's roles and deletes the service account.
 - **What stays:**
   - the pool, which grants nothing without a provider and lets a later setup reuse it;
-  - the APIs the setup enabled;
-  - the Data Access audit log setting.
+  - the APIs the setup enabled.
 - **Rerunning** is safe.
 
 ## Tests

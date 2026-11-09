@@ -27,7 +27,6 @@ AI_SRE=false
 AI_SRE_TOKEN=""
 AI_SRE_REMOVE=false
 AI_SRE_REMOVE_PROVIDER=""
-AI_SRE_AUDIT_LOGS=false
 AI_SRE_DEFAULT_API_URL="https://telemetry.betterstack.com"
 AI_SRE_API_URL="$AI_SRE_DEFAULT_API_URL"
 
@@ -73,7 +72,7 @@ AI_SRE_CHANGED=false
 # Whether a value is one of this script's own options (so --ai-sre got no token).
 ai_sre_is_option() {
   case "${1%%=*}" in
-    --help|-h|--project|--ai-sre|--ai-sre-remove|--api-url|--audit-logs) return 0 ;;
+    --help|-h|--project|--ai-sre|--ai-sre-remove|--api-url) return 0 ;;
   esac
   return 1
 }
@@ -461,36 +460,6 @@ ai_sre_allow_impersonation() {
     --member="$member" --role="roles/iam.workloadIdentityUser" --condition=None --quiet
 }
 
-ai_sre_enable_audit_logs() {
-  local role="roles/resourcemanager.projectIamAdmin on project ${AI_SRE_PROJECT}"
-  local policy_file="$AI_SRE_TMP/policy.json" changed
-  echo "Turning on Data Access audit logs (DATA_READ) for mcp.googleapis.com in ${AI_SRE_PROJECT}..."
-  ai_sre_gcloud "Reading the IAM policy of ${AI_SRE_PROJECT}" "$role" \
-    projects get-iam-policy "$AI_SRE_PROJECT" --format=json
-  changed=$(python3 -c '
-import json, sys
-policy = json.loads(sys.argv[1])
-configs = policy.setdefault("auditConfigs", [])
-config = next((c for c in configs if c.get("service") == "mcp.googleapis.com"), None)
-if config is None:
-    config = {"service": "mcp.googleapis.com", "auditLogConfigs": []}
-    configs.append(config)
-logs = config.setdefault("auditLogConfigs", [])
-if any(l.get("logType") == "DATA_READ" for l in logs):
-    print("no")
-else:
-    logs.append({"logType": "DATA_READ"})
-    json.dump(policy, open(sys.argv[2], "w"))
-    print("yes")
-' "$AI_SRE_OUT" "$policy_file") || ai_sre_error "Could not read the IAM policy of ${AI_SRE_PROJECT}."
-  if [ "$changed" = "no" ]; then
-    echo "  Already on."
-    return 0
-  fi
-  ai_sre_gcloud "Turning on audit logs" "$role" \
-    projects set-iam-policy "$AI_SRE_PROJECT" "$policy_file" --quiet
-}
-
 # After a refusal, deletes the integration's provider if this run created it.
 ai_sre_delete_own_provider() {
   [ "$AI_SRE_PROVIDER_CREATED" = true ] || return 0
@@ -603,7 +572,6 @@ ai_sre_main() {
   echo "  Identity pool:    $AI_SRE_POOL (its own; the ingestion setup's pool is not touched)"
   echo "  Service account:  $AI_SRE_SA"
   echo "  Servers:          ${AI_SRE_APIS[*]}"
-  echo "  Audit logs:       $([ "$AI_SRE_AUDIT_LOGS" = true ] && echo "on (DATA_READ for mcp.googleapis.com)" || echo "not changed (--audit-logs turns them on)")"
   echo ""
 
   ai_sre_project_number
@@ -614,7 +582,6 @@ ai_sre_main() {
   ai_sre_ensure_service_account
   ai_sre_grant_roles
   ai_sre_allow_impersonation
-  [ "$AI_SRE_AUDIT_LOGS" = true ] && ai_sre_enable_audit_logs
 
   ai_sre_register
 
@@ -642,7 +609,7 @@ ai_sre_remove_main() {
   if ! [[ "$AI_SRE_REMOVE_PROVIDER" =~ ^betterstack-ai-sre-[0-9a-f]{8}$ ]]; then
     ai_sre_error "--ai-sre-remove needs the provider ID printed at the end of the setup (betterstack-ai-sre-<8 hex>)."
   fi
-  if [ "$AI_SRE_AUDIT_LOGS" = true ] || [ "$AI_SRE_API_URL" != "$AI_SRE_DEFAULT_API_URL" ]; then
+  if [ "$AI_SRE_API_URL" != "$AI_SRE_DEFAULT_API_URL" ]; then
     ai_sre_error "--ai-sre-remove takes only --project."
   fi
   ai_sre_require_project
@@ -730,9 +697,6 @@ Usage:
 
   --ai-sre <token>           Registration token from the GCP integration in Better Stack
   --project <id>             Project to connect (required; the one shown in Better Stack)
-  --audit-logs               Turn on Data Access audit logs (DATA_READ) for
-                             mcp.googleapis.com. Off by default: they are billed
-                             as Cloud Logging ingestion.
   --api-url <url>            Better Stack API base URL (default: ${AI_SRE_DEFAULT_API_URL})
   --ai-sre-remove <id>       Remove an integration's provider (betterstack-ai-sre-<8 hex>,
                              printed at the end of the setup). With no other AI SRE
@@ -764,7 +728,6 @@ while [ $# -gt 0 ]; do
       ;;
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
     --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
-    --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
     *)
       # Show only an option's name: a stray value may be a token.
       if [[ "${1%%=*}" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then

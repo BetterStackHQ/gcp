@@ -134,10 +134,6 @@ case "$ARGS" in
     fi
     echo 0 >"$S/sa-lag"
     ;;
-  "projects get-iam-policy "*)
-    cat "$S/policy.json" 2>/dev/null || echo '{"bindings": [], "etag": "BwX1"}'
-    ;;
-  "projects set-iam-policy "*) cp "$4" "$S/policy.json" ;;
   *) : ;;
 esac
 exit 0
@@ -539,27 +535,6 @@ test_remove_arguments() {
   refute_call "gcloud"
 }
 
-test_audit_logs() {
-  start_case audit_logs
-  echo '{"bindings": [], "auditConfigs": [{"service": "allServices", "auditLogConfigs": [{"logType": "ADMIN_READ"}]}], "etag": "BwX1"}' >"$MOCK/state/policy.json"
-  run_setup --ai-sre "$TOKEN" --project pool-proj --audit-logs
-  assert_status 0
-  assert_call "gcloud projects set-iam-policy pool-proj"
-  check "audit config not merged into the policy" python3 -c '
-import json, sys
-p = json.load(open(sys.argv[1]))
-mcp = [c for c in p["auditConfigs"] if c["service"] == "mcp.googleapis.com"]
-assert mcp == [{"service": "mcp.googleapis.com", "auditLogConfigs": [{"logType": "DATA_READ"}]}], p
-assert p["etag"] == "BwX1" and len(p["auditConfigs"]) == 2, p
-' "$MOCK/state/policy.json"
-
-  # A second run leaves the policy alone.
-  run_setup --ai-sre "$TOKEN" --project pool-proj --audit-logs
-  assert_status 0
-  assert_output "Already on."
-  refute_call "set-iam-policy"
-}
-
 test_services_option_is_gone() {
   start_case services_gone
   run_setup --ai-sre "$TOKEN" --project pool-proj --services cloudtrace
@@ -813,18 +788,21 @@ test_rejects_unexpected_api_answers() {
   refute_call "gcloud"
 }
 
-# There is no dry run: --dry-run must stop before anything runs, not be ignored.
-test_dry_run_is_refused() {
-  start_case dry_run
-  run_setup --ai-sre "$TOKEN" --project pool-proj --dry-run
-  assert_status 1
-  assert_output "Unknown argument: --dry-run"
-  check "a command ran" not test -s "$MOCK/calls.log"
+# Removed options (--dry-run, --audit-logs) must stop before anything runs, not be ignored.
+test_removed_options_are_refused() {
+  local option
+  for option in --dry-run --audit-logs; do
+    start_case "removed${option}"
+    run_setup --ai-sre "$TOKEN" --project pool-proj "$option"
+    assert_status 1
+    assert_output "Unknown argument: $option"
+    check "a command ran" not test -s "$MOCK/calls.log"
 
-  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj --dry-run
-  assert_status 1
-  assert_output "Unknown argument: --dry-run"
-  check "a command ran" not test -s "$MOCK/calls.log"
+    run_setup --ai-sre-remove "$PROVIDER" --project pool-proj "$option"
+    assert_status 1
+    assert_output "Unknown argument: $option"
+    check "a command ran" not test -s "$MOCK/calls.log"
+  done
 }
 
 test_argument_errors() {
@@ -837,7 +815,7 @@ test_argument_errors() {
   assert_status 1
   assert_output "--ai-sre needs the registration token"
 
-  run_setup --ai-sre "$TOKEN" --project pool-proj --api-url --audit-logs
+  run_setup --ai-sre "$TOKEN" --project pool-proj --api-url
   assert_status 1
   assert_output "--api-url needs a value."
 
@@ -868,8 +846,7 @@ test_argument_errors() {
   run_setup --help
   assert_status 0
   assert_output "ai-sre-setup.sh --ai-sre <token> --project <id>"
-  assert_output "--audit-logs"
-  assert_output "billed"
+  refute_output "--audit-logs"
 }
 
 # A rerun of a registered integration (after it expired) restores access to the same project.
@@ -891,7 +868,7 @@ test_never_touches_ingestion_resources() {
     echo DELETED >"$MOCK/state/pool"
     touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
     if [ "$run" = setup ]; then
-      run_setup --ai-sre "$TOKEN" --project pool-proj --audit-logs
+      run_setup --ai-sre "$TOKEN" --project pool-proj
     else
       run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
     fi
