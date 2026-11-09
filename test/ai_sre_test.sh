@@ -69,6 +69,11 @@ case "$ARGS" in
     ;;
   "iam workload-identity-pools create "*) echo ACTIVE >"$S/pool" ;;
   "iam workload-identity-pools undelete "*) echo ACTIVE >"$S/pool" ;;
+  # A deleted pool stays describable in state DELETED, as at Google (for 30 days).
+  "iam workload-identity-pools delete "*)
+    [ -f "$S/pool" ] || { echo "ERROR: (gcloud.iam.workload-identity-pools.delete) NOT_FOUND: Requested entity was not found." >&2; exit 1; }
+    echo DELETED >"$S/pool"
+    ;;
   # A deleted provider stays describable in state DELETED, as at Google (for 30 days).
   "iam workload-identity-pools providers list "*)
     [ -f "$S/pool" ] || { echo "ERROR: (gcloud.iam.workload-identity-pools.providers.list) NOT_FOUND: Requested entity was not found." >&2; exit 1; }
@@ -254,6 +259,8 @@ refute_output() { check "output has: $1" not has_output "$1"; }
 assert_call() { check "no call: $1" has_call "$1"; }
 refute_call() { check "unexpected call: $1" not has_call "$1"; }
 assert_call_count() { check "$(grep -cF -- "$1" "$MOCK/calls.log") calls of '$1', expected $2" call_count_is "$1" "$2"; }
+output_line_count_is() { [ "$(grep -cxF -- "$1" <<<"$OUTPUT")" -eq "$2" ]; }
+assert_output_line_count() { check "$(grep -cxF -- "$1" <<<"$OUTPUT") lines '$1', expected $2" output_line_count_is "$1" "$2"; }
 
 SA="betterstack-ai-sre@pool-proj.iam.gserviceaccount.com"
 ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser
@@ -378,10 +385,14 @@ test_remove_last_provider() {
     assert_call "gcloud projects remove-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=$role --condition=None"
   done
   assert_call "gcloud iam service-accounts delete $SA --project=pool-proj --quiet"
-  refute_call "workload-identity-pools delete"
+  assert_output "Deleting workload identity pool betterstack-ai-sre-pool..."
+  assert_call "gcloud iam workload-identity-pools delete betterstack-ai-sre-pool --location=global --project=pool-proj --quiet"
+  check "the pool is still there" grep -qx DELETED "$MOCK/state/pool"
   refute_call "providers delete betterstack-provider"
   refute_call "curl"
   assert_output "AI SRE access removed from pool-proj."
+  assert_output "The workload identity pool betterstack-ai-sre-pool is deleted too."
+  refute_output "stays"
 }
 
 test_remove_keeps_access_other_integrations_use() {
@@ -394,6 +405,9 @@ test_remove_keeps_access_other_integrations_use() {
   refute_call "providers delete betterstack-ai-sre-0a1b2c3d"
   refute_call "remove-iam-policy-binding"
   refute_call "service-accounts delete"
+  refute_call "workload-identity-pools delete"
+  check "the pool was deleted" grep -qx ACTIVE "$MOCK/state/pool"
+  refute_output "Deleting workload identity pool"
   assert_output "Kept $SA and its roles: these AI SRE providers in pool-proj still use them:"
   assert_output "    betterstack-ai-sre-0a1b2c3d"
   assert_output "--ai-sre-remove betterstack-ai-sre-0a1b2c3d --project pool-proj"
@@ -443,7 +457,67 @@ test_remove_without_the_pool() {
   assert_output "Provider $PROVIDER is already removed."
   assert_call_count "remove-iam-policy-binding" 8
   check "the service account is still there" not test -f "$MOCK/state/sa-$SA"
+  assert_output "Deleting workload identity pool betterstack-ai-sre-pool..."
+  refute_call "workload-identity-pools delete"
+  assert_output_line_count "  Already deleted." 1
   assert_output "AI SRE access removed from pool-proj."
+}
+
+# A pool an earlier removal deleted is described as DELETED for 30 days: it is already deleted.
+test_remove_after_the_pool_was_deleted() {
+  start_case remove_pool_gone
+  echo DELETED >"$MOCK/state/pool"
+  echo DELETED >"$MOCK/state/provider-$PROVIDER"
+  touch "$MOCK/state/sa-$SA"
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 0
+  assert_output "Deleting workload identity pool betterstack-ai-sre-pool..."
+  refute_call "workload-identity-pools delete"
+  assert_output_line_count "  Already deleted." 1
+  assert_output "AI SRE access removed from pool-proj."
+
+  # Deleted by someone else between the check and the delete.
+  start_case remove_pool_race
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="workload-identity-pools delete betterstack-ai-sre-pool"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.delete) NOT_FOUND: Requested entity was not found."
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 0
+  assert_call "gcloud iam workload-identity-pools delete betterstack-ai-sre-pool"
+  assert_output_line_count "  Already deleted." 1
+  assert_output "AI SRE access removed from pool-proj."
+}
+
+test_remove_pool_permission_error() {
+  start_case remove_pool_denied
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  export MOCK_FAIL_PATTERN="workload-identity-pools delete betterstack-ai-sre-pool"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.workload-identity-pools.delete) PERMISSION_DENIED: Permission 'iam.workloadIdentityPools.delete' denied on resource (or it may not exist)."
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 1
+  assert_output "Error: Deleting pool betterstack-ai-sre-pool failed: permission denied."
+  assert_output "needs roles/iam.workloadIdentityPoolAdmin on project pool-proj"
+  refute_output "AI SRE access removed"
+}
+
+# A setup after the last provider was removed restores the deleted pool.
+test_setup_after_removal() {
+  start_case setup_after_removal
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/provider-$PROVIDER" "$MOCK/state/sa-$SA"
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj
+  assert_status 0
+  check "the pool is not deleted" grep -qx DELETED "$MOCK/state/pool"
+
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_output "  Restoring pool, which was deleted."
+  assert_call "gcloud iam workload-identity-pools undelete betterstack-ai-sre-pool --location=global --project=pool-proj"
+  refute_call "workload-identity-pools create"
+  check "the pool is not active" grep -qx ACTIVE "$MOCK/state/pool"
+  assert_output "AI SRE setup complete!"
 }
 
 test_remove_stops_when_the_provider_cannot_be_checked() {

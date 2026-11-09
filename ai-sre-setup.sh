@@ -364,6 +364,7 @@ ai_sre_ensure_pool() {
       ;;
     ACTIVE*) echo "  Reusing existing pool." ;;
     DELETED*)
+      echo "  Restoring pool, which was deleted."
       ai_sre_gcloud "Restoring pool ${AI_SRE_POOL}" "$role" \
         iam workload-identity-pools undelete "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT"
       ;;
@@ -636,7 +637,7 @@ ai_sre_remove_main() {
     echo "  Provider ${AI_SRE_PROVIDER} is already removed."
   fi
 
-  # The service account and its roles go only with the last AI SRE provider.
+  # The service account, its roles and the pool go only with the last AI SRE provider.
   echo "Checking for other Better Stack AI SRE providers..."
   ai_sre_probe "Listing the providers in ${AI_SRE_POOL}" "$pool_role" \
     iam workload-identity-pools providers list --workload-identity-pool="$AI_SRE_POOL" \
@@ -674,6 +675,17 @@ ai_sre_remove_main() {
     else
       echo "  Already deleted."
     fi
+    echo "Deleting workload identity pool ${AI_SRE_POOL}..."
+    ai_sre_probe "Checking pool ${AI_SRE_POOL}" "$pool_role" iam workload-identity-pools describe "$AI_SRE_POOL" \
+      --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
+    case "$AI_SRE_OUT" in
+      ACTIVE*)
+        ai_sre_gcloud --missing-ok "Deleting pool ${AI_SRE_POOL}" "$pool_role" \
+          iam workload-identity-pools delete "$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet \
+          || echo "  Already deleted."
+        ;;
+      *) echo "  Already deleted." ;;
+    esac
   fi
 
   echo ""
@@ -682,7 +694,7 @@ ai_sre_remove_main() {
     return 0
   fi
   echo "AI SRE access removed from ${AI_SRE_PROJECT}."
-  echo "The workload identity pool ${AI_SRE_POOL} stays, so a later setup can reuse it; it grants no access without a provider."
+  echo "The workload identity pool ${AI_SRE_POOL} is deleted too."
 }
 
 
@@ -700,7 +712,8 @@ Usage:
   --api-url <url>            Better Stack API base URL (default: ${AI_SRE_DEFAULT_API_URL})
   --ai-sre-remove <id>       Remove an integration's provider (betterstack-ai-sre-<8 hex>,
                              printed at the end of the setup). With no other AI SRE
-                             provider left, also removes the service account and its roles.
+                             provider left, also removes the service account, its roles
+                             and the workload identity pool.
   --help, -h                 Show this help and exit
 
 Log and metrics ingestion is set up by setup.sh, not this script.
