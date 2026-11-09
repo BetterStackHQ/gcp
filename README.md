@@ -134,12 +134,3 @@ Removing the integration in Better Stack ends its access, and the confirmation s
 curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup.sh | bash -s -- \
   --ai-sre-remove betterstack-ai-sre-1a2b3c4d --project my-project
 ```
-
-## Tests
-
-`test/ai_sre_test.sh` tests `ai-sre-setup.sh` against mocked `gcloud` and `curl`, so it needs no GCP project or Better Stack account:
-
-```bash
-test/ai_sre_test.sh
-shellcheck ai-sre-setup.sh test/ai_sre_test.sh
-```
