@@ -30,7 +30,6 @@ AI_SRE_REMOVE_PROVIDER=""
 AI_SRE_AUDIT_LOGS=false
 AI_SRE_DEFAULT_API_URL="https://telemetry.betterstack.com"
 AI_SRE_API_URL="$AI_SRE_DEFAULT_API_URL"
-DRY_RUN=false
 
 AI_SRE_CALLER="ai-sre-caller@better-stack.iam.gserviceaccount.com"
 # Not the ingestion setup's betterstack-pool: AI SRE never touches it.
@@ -65,7 +64,7 @@ AI_SRE_CHANGED=false
 # Whether a value is one of this script's own options (so --ai-sre got no token).
 ai_sre_is_option() {
   case "${1%%=*}" in
-    --help|-h|--project|--ai-sre|--ai-sre-remove|--api-url|--audit-logs|--dry-run) return 0 ;;
+    --help|-h|--project|--ai-sre|--ai-sre-remove|--api-url|--audit-logs) return 0 ;;
   esac
   return 1
 }
@@ -74,19 +73,6 @@ ai_sre_error() {
   echo ""
   echo "Error: $*"
   exit 1
-}
-
-# Prints a command the way a shell would read it back.
-ai_sre_show() {
-  local line="  $" arg q="'"
-  for arg in "$@"; do
-    if [[ "$arg" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
-      line+=" $arg"
-    else
-      line+=" ${q}${arg//${q}/${q}\\${q}${q}}${q}"
-    fi
-  done
-  echo "$line"
 }
 
 ai_sre_rerun_hint() {
@@ -135,11 +121,6 @@ ai_sre_gcloud() {
   fi
   what="$1" role="$2"
   shift 2
-  if [ "$DRY_RUN" = true ]; then
-    ai_sre_show gcloud "$@"
-    AI_SRE_OUT=""
-    return 0
-  fi
   for attempt in $(seq 1 12); do
     status=0
     AI_SRE_OUT=$(gcloud "$@" 2>"$AI_SRE_TMP/gcloud.err") || status=$?
@@ -174,11 +155,6 @@ ai_sre_api() {
   local args=(-sS -X "$method" -H "Accept: application/json" --connect-timeout 10 --max-time 60)
   if [ -n "$data" ]; then
     args+=(-H "Content-Type: application/json" --data "$data")
-  fi
-  if [ "$DRY_RUN" = true ]; then
-    ai_sre_show curl "${args[@]}" -H "Authorization: Bearer <token>" "$url"
-    AI_SRE_STATUS="dry-run"
-    return 0
   fi
   : >"$AI_SRE_TMP/body.json"
   # The token is read from a file so it never shows in the process list.
@@ -259,13 +235,6 @@ ai_sre_fetch_audience() {
       *) break ;;
     esac
   done
-  if [ "$DRY_RUN" = true ]; then
-    AI_SRE_AUDIENCE="AUDIENCE_FROM_BETTER_STACK"
-    AI_SRE_PROVIDER="${AI_SRE_PROVIDER_PREFIX}XXXXXXXX"
-    echo "  Dry run: using placeholders for the audience and the provider."
-    echo ""
-    return 0
-  fi
   case "$AI_SRE_STATUS" in
     200) ;;
     401) ai_sre_token_rejected ;;
@@ -312,10 +281,6 @@ ai_sre_project_number() {
   ai_sre_gcloud "Reading project ${AI_SRE_PROJECT}" "roles/browser on project ${AI_SRE_PROJECT}" \
     projects describe "$AI_SRE_PROJECT" --format='value(projectNumber)'
   AI_SRE_FAIL_NOTE=""
-  if [ "$DRY_RUN" = true ]; then
-    AI_SRE_PROJECT_NUMBER="PROJECT_NUMBER"
-    return 0
-  fi
   AI_SRE_PROJECT_NUMBER=$(tr -d '[:space:]' <<<"$AI_SRE_OUT")
   [[ "$AI_SRE_PROJECT_NUMBER" =~ ^[0-9]+$ ]] || ai_sre_error "Could not read the project number of ${AI_SRE_PROJECT}."
 }
@@ -434,10 +399,6 @@ ai_sre_enable_audit_logs() {
   echo "Turning on Data Access audit logs (DATA_READ) for mcp.googleapis.com in ${AI_SRE_PROJECT}..."
   ai_sre_gcloud "Reading the IAM policy of ${AI_SRE_PROJECT}" "$role" \
     projects get-iam-policy "$AI_SRE_PROJECT" --format=json
-  if [ "$DRY_RUN" = true ]; then
-    ai_sre_show gcloud projects set-iam-policy "$AI_SRE_PROJECT" "POLICY_WITH_MCP_DATA_READ.json" --quiet
-    return 0
-  fi
   changed=$(python3 -c '
 import json, sys
 policy = json.loads(sys.argv[1])
@@ -483,7 +444,6 @@ ai_sre_register() {
   while true; do
     ai_sre_api POST /api/v1/ai-sre/gcp-registrations "$body"
     case "$AI_SRE_STATUS" in
-      dry-run) return 0 ;;
       200|201) return 0 ;;
       401)
         if [ "$unanswered" = true ]; then
@@ -554,10 +514,8 @@ ai_sre_main() {
   [[ "$AI_SRE_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || ai_sre_error "--api-url must be an https URL."
 
   command -v python3 >/dev/null || ai_sre_error "python3 is required."
-  if [ "$DRY_RUN" = false ]; then
-    command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
-    command -v curl >/dev/null || ai_sre_error "curl is required."
-  fi
+  command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
+  command -v curl >/dev/null || ai_sre_error "curl is required."
 
   ai_sre_make_tmp
   printf 'Authorization: Bearer %s\n' "$AI_SRE_TOKEN" >"$AI_SRE_TMP/auth-header"
@@ -565,10 +523,6 @@ ai_sre_main() {
   echo "Better Stack AI SRE Setup"
   echo "========================="
   echo ""
-  if [ "$DRY_RUN" = true ]; then
-    echo "Dry run: printing every gcloud and curl call without running any."
-    echo ""
-  fi
 
   ai_sre_fetch_audience
 
@@ -594,10 +548,6 @@ ai_sre_main() {
   ai_sre_register
 
   echo ""
-  if [ "$DRY_RUN" = true ]; then
-    echo "Dry run complete: nothing was changed."
-    return 0
-  fi
   echo "==================================="
   echo "AI SRE setup complete!"
   echo "==================================="
@@ -622,12 +572,10 @@ ai_sre_remove_main() {
     ai_sre_error "--ai-sre-remove needs the provider ID printed at the end of the setup (betterstack-ai-sre-<8 hex>)."
   fi
   if [ "$AI_SRE_AUDIT_LOGS" = true ] || [ "$AI_SRE_API_URL" != "$AI_SRE_DEFAULT_API_URL" ]; then
-    ai_sre_error "--ai-sre-remove takes only --project and --dry-run."
+    ai_sre_error "--ai-sre-remove takes only --project."
   fi
   ai_sre_require_project
-  if [ "$DRY_RUN" = false ]; then
-    command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
-  fi
+  command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
   ai_sre_make_tmp
   AI_SRE_PROVIDER="$AI_SRE_REMOVE_PROVIDER"
   AI_SRE_SA="${AI_SRE_SA_NAME}@${AI_SRE_PROJECT}.iam.gserviceaccount.com"
@@ -636,20 +584,16 @@ ai_sre_remove_main() {
   echo "Better Stack AI SRE Removal"
   echo "==========================="
   echo ""
-  if [ "$DRY_RUN" = true ]; then
-    echo "Dry run: printing every gcloud call without running any."
-    echo ""
-  fi
 
   echo "Removing provider ${AI_SRE_PROVIDER} from ${AI_SRE_POOL} in ${AI_SRE_PROJECT}..."
   ai_sre_probe "Checking provider ${AI_SRE_PROVIDER}" "$pool_role" \
     iam workload-identity-pools providers describe "$AI_SRE_PROVIDER" \
     --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --format='value(state)'
-  if [ "$DRY_RUN" = true ] || [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ]; then
+  if [ "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" = "ACTIVE" ]; then
     ai_sre_gcloud "Deleting provider ${AI_SRE_PROVIDER}" "$pool_role" \
       iam workload-identity-pools providers delete "$AI_SRE_PROVIDER" \
       --workload-identity-pool="$AI_SRE_POOL" --location=global --project="$AI_SRE_PROJECT" --quiet
-    [ "$DRY_RUN" = true ] || echo "  Deleted provider ${AI_SRE_PROVIDER}."
+    echo "  Deleted provider ${AI_SRE_PROVIDER}."
   else
     echo "  Provider ${AI_SRE_PROVIDER} is already removed."
   fi
@@ -686,7 +630,7 @@ ai_sre_remove_main() {
     done
     echo "Deleting service account ${AI_SRE_SA}..."
     sa_role="roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}"
-    if ai_sre_service_account_exists "$sa_role" || [ "$DRY_RUN" = true ]; then
+    if ai_sre_service_account_exists "$sa_role"; then
       ai_sre_gcloud --missing-ok "Deleting service account ${AI_SRE_SA}" "$sa_role" \
         iam service-accounts delete "$AI_SRE_SA" --project="$AI_SRE_PROJECT" --quiet || echo "  Already deleted."
     else
@@ -695,10 +639,6 @@ ai_sre_remove_main() {
   fi
 
   echo ""
-  if [ "$DRY_RUN" = true ]; then
-    echo "Dry run complete: nothing was changed."
-    return 0
-  fi
   if [ "${#others[@]}" -gt 0 ]; then
     echo "Removed provider ${AI_SRE_PROVIDER} from ${AI_SRE_PROJECT}. AI SRE can still reach ${AI_SRE_PROJECT} through the providers listed above."
     return 0
@@ -714,7 +654,7 @@ Better Stack AI SRE Setup for Google Cloud
 
 Usage:
   $(basename "$0") --ai-sre <token> --project <id> [options]
-  $(basename "$0") --ai-sre-remove <provider id> --project <id> [--dry-run]
+  $(basename "$0") --ai-sre-remove <provider id> --project <id>
   $(basename "$0") --help
 
   --ai-sre <token>           Registration token from the GCP integration in Better Stack
@@ -723,7 +663,6 @@ Usage:
                              mcp.googleapis.com. Off by default: they are billed
                              as Cloud Logging ingestion.
   --api-url <url>            Better Stack API base URL (default: ${AI_SRE_DEFAULT_API_URL})
-  --dry-run                  Print every gcloud and curl call without running any
   --ai-sre-remove <id>       Remove an integration's provider (betterstack-ai-sre-<8 hex>,
                              printed at the end of the setup). With no other AI SRE
                              provider left, also removes the service account and its roles.
@@ -755,7 +694,6 @@ while [ $# -gt 0 ]; do
     --api-url=*) AI_SRE_API_URL="${1#*=}"; shift ;;
     --api-url) [[ "${2:--}" != -* ]] || { echo "Error: --api-url needs a value."; exit 1; }; AI_SRE_API_URL="$2"; shift 2 ;;
     --audit-logs) AI_SRE_AUDIT_LOGS=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
     *)
       # Show only an option's name: a stray value may be a token.
       if [[ "${1%%=*}" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then

@@ -281,10 +281,6 @@ test_project_is_required() {
   assert_output "--project is required"
   refute_call "curl"
   refute_call "gcloud"
-
-  run_setup --ai-sre "$TOKEN" --dry-run
-  assert_status 1
-  assert_output "--project is required"
 }
 
 test_wrong_project_is_refused_before_any_change() {
@@ -504,16 +500,7 @@ test_remove_permission_error() {
   refute_call "remove-iam-policy-binding"
 }
 
-test_remove_dry_run_and_arguments() {
-  start_case remove_dry_run
-  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj --dry-run
-  assert_status 0
-  check "dry run ran a command" not test -s "$MOCK/calls.log"
-  assert_output "\$ gcloud iam workload-identity-pools providers delete $PROVIDER"
-  assert_output "\$ gcloud projects remove-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=roles/mcp.toolUser"
-  assert_output "\$ gcloud iam service-accounts delete $SA"
-  refute_output "Deleted provider"
-
+test_remove_arguments() {
   start_case remove_args
   run_setup --ai-sre-remove betterstack-ai-sre --project pool-proj
   assert_status 1
@@ -794,19 +781,18 @@ test_rejects_unexpected_api_answers() {
   refute_call "gcloud"
 }
 
-test_dry_run() {
+# There is no dry run: --dry-run must stop before anything runs, not be ignored.
+test_dry_run_is_refused() {
   start_case dry_run
-  run_setup --ai-sre "$TOKEN" --dry-run --project pool-proj --audit-logs
-  assert_status 0
-  check "dry run ran a command" not test -s "$MOCK/calls.log"
-  assert_output "\$ curl -sS -X GET"
-  assert_output "\$ gcloud iam workload-identity-pools providers create-oidc betterstack-ai-sre-XXXXXXXX"
-  assert_output "\$ gcloud projects add-iam-policy-binding pool-proj --member=serviceAccount:$SA --role=roles/cloudtrace.user"
-  assert_output "\$ gcloud projects set-iam-policy pool-proj"
-  assert_output "\$ curl -sS -X POST"
-  assert_output "Authorization: Bearer <token>"
-  refute_output "$TOKEN"
-  assert_output "Dry run complete: nothing was changed."
+  run_setup --ai-sre "$TOKEN" --project pool-proj --dry-run
+  assert_status 1
+  assert_output "Unknown argument: --dry-run"
+  check "a command ran" not test -s "$MOCK/calls.log"
+
+  run_setup --ai-sre-remove "$PROVIDER" --project pool-proj --dry-run
+  assert_status 1
+  assert_output "Unknown argument: --dry-run"
+  check "a command ran" not test -s "$MOCK/calls.log"
 }
 
 test_argument_errors() {

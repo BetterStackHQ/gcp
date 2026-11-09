@@ -101,7 +101,6 @@ The script also enables `iam`, `iamcredentials` and `sts`. The script then regis
 | `--project <id>` | Project to connect (required): the one shown on the integration in Better Stack |
 | `--audit-logs` | Turns on Data Access audit logs (`DATA_READ` for `mcp.googleapis.com`), so every MCP call is logged in your project. Off by default: they are billed as Cloud Logging ingestion. |
 | `--api-url <url>` | Better Stack API base URL (default: `https://telemetry.betterstack.com`) |
-| `--dry-run` | Prints every `gcloud` and `curl` call without running any. It assumes a first run, with placeholders for the audience, the provider and the project number. |
 
 ### Permissions and errors
 
@@ -125,7 +124,7 @@ curl -fsSL https://raw.githubusercontent.com/BetterStackHQ/gcp/main/ai-sre-setup
   --ai-sre-remove betterstack-ai-sre-<8 hex> --project my-project
 ```
 
-It deletes that integration's provider. When no other AI SRE provider is left in the pool, it also removes the service account's roles and deletes the service account. The pool stays, so a later setup can reuse it (it grants nothing without a provider), and Data Access audit logs stay as they are. Add `--dry-run` to see the commands first. Removing the integration in Better Stack already ends its access: this only tidies up the project.
+It deletes that integration's provider. When no other AI SRE provider is left in the pool, it also removes the service account's roles and deletes the service account. The pool stays, so a later setup can reuse it (it grants nothing without a provider), and Data Access audit logs stay as they are. Removing the integration in Better Stack already ends its access: this only tidies up the project.
 
 ## Terraform
 
