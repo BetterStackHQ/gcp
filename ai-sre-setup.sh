@@ -52,8 +52,17 @@ AI_SRE_ROLES=(
   roles/container.viewer
 )
 AI_SRE_APIS=(logging monitoring run cloudresourcemanager cloudtrace clouderrorreporting container)
-AI_SRE_POOL_APIS=(iam iamcredentials sts)
-AI_SRE_REGISTER_TIMEOUT=180
+# What workload identity federation and Better Stack's check (it lists Cloud Logging's tools) need:
+# turned on when off. The other servers' APIs are never turned on here: enabling one can have side
+# effects (Kubernetes Engine also turns on Compute Engine, which creates its default service account),
+# and a server whose API is off has nothing to read anyway.
+AI_SRE_REQUIRED_APIS=(iam iamcredentials sts logging)
+# Google usually applies IAM changes within 2 minutes, but documents 7 or more.
+AI_SRE_REGISTER_TIMEOUT=600
+# How long to wait for Better Stack to answer before anything changes.
+AI_SRE_API_TIMEOUT=180
+AI_SRE_LAST_ERROR=""
+AI_SRE_SA_DISABLED=false
 AI_SRE_OUT=""
 AI_SRE_STATUS=""
 # A line ai_sre_gcloud_failed adds to its explanation, for the call that sets it.
@@ -86,11 +95,27 @@ ai_sre_gcloud_failed() {
   echo ""
   if grep -q "FAILED_PRECONDITION" <<<"$out" && grep -q "iam.workloadIdentityPoolProviders" <<<"$out"; then
     echo "Error: ${what} failed: an organization policy blocks it."
-    echo "  constraints/iam.workloadIdentityPoolProviders does not allow https://accounts.google.com"
-    echo "  as an identity provider. Allow it for project ${AI_SRE_PROJECT} with the command below"
-    echo "  (needs roles/orgpolicy.policyAdmin), then run this script again:"
+    echo "  constraints/iam.workloadIdentityPoolProviders doesn't allow https://accounts.google.com as an"
+    echo "  identity provider in project ${AI_SRE_PROJECT}. Ask your organization policy admin to allow it"
+    echo "  for this project and to keep the values the project inherits: replacing them could block your"
+    echo "  other identity providers. This policy does both (apply it with gcloud org-policies set-policy):"
     echo ""
-    echo "    gcloud resource-manager org-policies allow constraints/iam.workloadIdentityPoolProviders https://accounts.google.com --project=${AI_SRE_PROJECT}"
+    echo "    name: projects/${AI_SRE_PROJECT}/policies/iam.workloadIdentityPoolProviders"
+    echo "    spec:"
+    echo "      inheritFromParent: true"
+    echo "      rules:"
+    echo "        - values:"
+    echo "            allowedValues:"
+    echo "              - https://accounts.google.com"
+  elif grep -qiE "iam.disableServiceAccountCreation|service account creation is not allowed" <<<"$out"; then
+    echo "Error: ${what} failed: an organization policy blocks it."
+    echo "  constraints/iam.disableServiceAccountCreation doesn't allow creating service accounts in"
+    echo "  project ${AI_SRE_PROJECT}. Ask your organization policy admin for an exception for this project."
+  elif grep -q "do not belong to a permitted customer" <<<"$out"; then
+    echo "Error: ${what} failed: an organization policy blocks it."
+    echo "  Domain restricted sharing (constraints/iam.allowedPolicyMemberDomains) doesn't allow this"
+    echo "  principal. It must allow service accounts and workload identity pools of your own organization,"
+    echo "  for example through your organization's principal set. Ask your organization policy admin."
   elif grep -qiE "PERMISSION_DENIED|does not have permission|Permission '[^']+' denied" <<<"$out"; then
     permission=$(grep -oE "Permission '[^']+'" <<<"$out" | head -n 1 | sed -E "s/Permission '([^']+)'/\1/" || true)
     echo "Error: ${what} failed: permission denied."
@@ -107,7 +132,15 @@ ai_sre_gcloud_failed() {
     echo "    $line"
   done <<<"$out"
   ai_sre_rerun_hint
+  ai_sre_undo_hint
   exit 1
+}
+
+# Once this run has started changing the project: how to undo it, for a failure the customer can't fix.
+ai_sre_undo_hint() {
+  [ "$AI_SRE_CHANGED" = true ] || return 0
+  echo "If you can't fix it, undo what this command set up in ${AI_SRE_PROJECT}:"
+  echo "  $(ai_sre_remove_command)"
 }
 
 # ai_sre_gcloud [--missing-ok] <what> <role needed> <gcloud args...>
@@ -129,8 +162,10 @@ ai_sre_gcloud() {
       AI_SRE_OUT=""
       return 1
     fi
-    # A service account created a moment ago can take up to a minute to reach IAM.
-    if [ "$attempt" -lt 12 ] && grep -qiE "service ?account .*does not exist" "$AI_SRE_TMP/gcloud.err"; then
+    # A service account created a moment ago can take up to a minute to reach IAM, and another
+    # change to the same IAM policy at the same moment (Terraform, a colleague) fails gcloud's
+    # read-modify-write: running the call again redoes all of it.
+    if [ "$attempt" -lt 12 ] && grep -qiE "service ?account .*does not exist|concurrent policy changes" "$AI_SRE_TMP/gcloud.err"; then
       sleep 5
       continue
     fi
@@ -211,12 +246,19 @@ ai_sre_remove_command() {
   echo "curl -fsSL ${AI_SRE_SCRIPT_URL} | bash -s -- --ai-sre-remove ${1:-$AI_SRE_PROVIDER} --project ${AI_SRE_PROJECT}"
 }
 
-# ai_sre_retry_wait <what>: waits before retrying a Better Stack call, backing off
-# from 5 to 30 seconds. Fails once the next wait would pass AI_SRE_REGISTER_TIMEOUT.
-# Reset AI_SRE_WAITED=0 and AI_SRE_DELAY=5 before the first call.
+# ai_sre_retry_wait <what> <limit in seconds>: waits before retrying a Better Stack call, backing
+# off from 5 to 30 seconds, and prints Better Stack's answer only when it changes. Fails once the
+# next wait would pass the limit.
+# Reset AI_SRE_WAITED=0, AI_SRE_DELAY=5 and AI_SRE_LAST_ERROR="" before the first call.
 ai_sre_retry_wait() {
-  [ $((AI_SRE_WAITED + AI_SRE_DELAY)) -le "$AI_SRE_REGISTER_TIMEOUT" ] || return 1
-  echo "  $1 ($(ai_sre_api_error)); retrying in ${AI_SRE_DELAY}s..."
+  local error
+  [ $((AI_SRE_WAITED + AI_SRE_DELAY)) -le "$2" ] || return 1
+  error=$(ai_sre_api_error)
+  if [ "$error" != "$AI_SRE_LAST_ERROR" ]; then
+    echo "  $1 (${error})."
+    AI_SRE_LAST_ERROR="$error"
+  fi
+  echo "  Retrying in ${AI_SRE_DELAY}s (waited ${AI_SRE_WAITED}s of up to ${2}s)..."
   sleep "$AI_SRE_DELAY"
   AI_SRE_WAITED=$((AI_SRE_WAITED + AI_SRE_DELAY))
   AI_SRE_DELAY=$((AI_SRE_DELAY * 2))
@@ -228,10 +270,11 @@ ai_sre_fetch_audience() {
   echo "Fetching the integration's details from Better Stack..."
   AI_SRE_WAITED=0
   AI_SRE_DELAY=5
+  AI_SRE_LAST_ERROR=""
   while true; do
     ai_sre_api GET /api/v1/ai-sre/gcp-registrations/audience
     case "$AI_SRE_STATUS" in
-      429|5??|000) ai_sre_retry_wait "Better Stack is not answering yet" || break ;;
+      429|5??|000) ai_sre_retry_wait "Better Stack is not answering yet" "$AI_SRE_API_TIMEOUT" || break ;;
       *) break ;;
     esac
   done
@@ -285,14 +328,28 @@ ai_sre_project_number() {
   [[ "$AI_SRE_PROJECT_NUMBER" =~ ^[0-9]+$ ]] || ai_sre_error "Could not read the project number of ${AI_SRE_PROJECT}."
 }
 
-ai_sre_enable_apis() {
-  local apis=("$@") services=() api
-  for api in "${apis[@]}"; do
-    services+=("${api}.googleapis.com")
+# Turns on the APIs this setup needs when they're off (AI_SRE_REQUIRED_APIS), and names the
+# servers whose API is off, which this script leaves alone.
+ai_sre_check_apis() {
+  local enabled api missing=() off=()
+  echo "Checking APIs in ${AI_SRE_PROJECT}..."
+  ai_sre_gcloud "Listing the APIs enabled in ${AI_SRE_PROJECT}" "roles/serviceusage.serviceUsageViewer on project ${AI_SRE_PROJECT}" \
+    services list --enabled --project="$AI_SRE_PROJECT" --format='value(config.name)'
+  enabled=" $(tr -s '[:space:]' ' ' <<<"$AI_SRE_OUT") "
+  for api in "${AI_SRE_REQUIRED_APIS[@]}"; do
+    [[ "$enabled" == *" ${api}.googleapis.com "* ]] || missing+=("${api}.googleapis.com")
   done
-  echo "Enabling APIs in ${AI_SRE_PROJECT}: ${apis[*]}..."
-  ai_sre_gcloud "Enabling APIs" "roles/serviceusage.serviceUsageAdmin on project ${AI_SRE_PROJECT}" \
-    services enable "${services[@]}" --project="$AI_SRE_PROJECT" --quiet
+  for api in "${AI_SRE_APIS[@]}"; do
+    [[ "$enabled" == *" ${api}.googleapis.com "* ]] || [[ " ${AI_SRE_REQUIRED_APIS[*]} " == *" ${api} "* ]] || off+=("$api")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "  Enabling ${missing[*]}..."
+    ai_sre_gcloud "Enabling APIs" "roles/serviceusage.serviceUsageAdmin on project ${AI_SRE_PROJECT}" \
+      services enable "${missing[@]}" --project="$AI_SRE_PROJECT" --quiet
+  fi
+  if [ "${#off[@]}" -gt 0 ]; then
+    echo "  Not enabled, so AI SRE has nothing to read from these servers here: ${off[*]}."
+  fi
 }
 
 ai_sre_ensure_pool() {
@@ -352,12 +409,17 @@ ai_sre_ensure_provider() {
   fi
 }
 
-# ai_sre_service_account_exists <role needed>: whether the AI SRE service account exists.
+# ai_sre_service_account_exists <role needed>: whether the AI SRE service account exists, with
+# AI_SRE_SA_DISABLED set to whether it is disabled.
 # Listed, not described: for weeks after a service account is deleted, Google answers describe
 # and delete on its email with PERMISSION_DENIED, not NOT_FOUND, but no longer lists it.
 ai_sre_service_account_exists() {
   ai_sre_gcloud "Checking service account ${AI_SRE_SA}" "$1" \
-    iam service-accounts list --project="$AI_SRE_PROJECT" --filter="email=${AI_SRE_SA}" --format='value(email)'
+    iam service-accounts list --project="$AI_SRE_PROJECT" --filter="email=${AI_SRE_SA}" --format='value(email,disabled)'
+  AI_SRE_SA_DISABLED=false
+  if grep -q "True" <<<"$AI_SRE_OUT"; then
+    AI_SRE_SA_DISABLED=true
+  fi
   [ -n "$(tr -d '[:space:]' <<<"$AI_SRE_OUT")" ]
 }
 
@@ -365,7 +427,13 @@ ai_sre_ensure_service_account() {
   local role="roles/iam.serviceAccountAdmin on project ${AI_SRE_PROJECT}"
   echo "Setting up service account ${AI_SRE_SA}..."
   if ai_sre_service_account_exists "$role"; then
-    echo "  Reusing existing service account."
+    if [ "$AI_SRE_SA_DISABLED" = true ]; then
+      echo "  Reusing existing service account, which is disabled: enabling it."
+      ai_sre_gcloud "Enabling service account ${AI_SRE_SA}" "$role" \
+        iam service-accounts enable "$AI_SRE_SA" --project="$AI_SRE_PROJECT"
+    else
+      echo "  Reusing existing service account."
+    fi
     return 0
   fi
   ai_sre_gcloud "Creating service account ${AI_SRE_SA}" "$role" \
@@ -441,6 +509,7 @@ ai_sre_register() {
   echo "  to apply IAM changes, so this retries for up to $((AI_SRE_REGISTER_TIMEOUT / 60)) minutes."
   AI_SRE_WAITED=0
   AI_SRE_DELAY=5
+  AI_SRE_LAST_ERROR=""
   while true; do
     ai_sre_api POST /api/v1/ai-sre/gcp-registrations "$body"
     case "$AI_SRE_STATUS" in
@@ -473,11 +542,13 @@ ai_sre_register() {
         exit 1
         ;;
     esac
-    if ! ai_sre_retry_wait "Not ready yet"; then
+    if ! ai_sre_retry_wait "Not ready yet" "$AI_SRE_REGISTER_TIMEOUT"; then
       echo ""
-      echo "Error: Better Stack could not use the new access after ${AI_SRE_WAITED} seconds ($(ai_sre_api_error))."
-      echo "  Google can take several minutes to apply IAM changes."
-      ai_sre_rerun_hint
+      echo "Error: Better Stack still can't use the new access after ${AI_SRE_WAITED} seconds ($(ai_sre_api_error))."
+      echo "  Usually Google is still applying the new IAM grants, and nothing needs fixing."
+      echo "  Run the same command again in a few minutes: the token works until a run succeeds."
+      echo "  If it keeps failing with the same message, contact Better Stack at hello@betterstack.com."
+      echo ""
       echo "To undo what this command set up in ${AI_SRE_PROJECT} instead:"
       echo "  $(ai_sre_remove_command)"
       exit 1
@@ -513,7 +584,7 @@ ai_sre_main() {
   AI_SRE_API_URL="${AI_SRE_API_URL%/}"
   [[ "$AI_SRE_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || ai_sre_error "--api-url must be an https URL."
 
-  command -v python3 >/dev/null || ai_sre_error "python3 is required."
+  python3 -c '' >/dev/null 2>&1 || ai_sre_error "python3 is required (on macOS: xcode-select --install)."
   command -v gcloud >/dev/null || ai_sre_error "gcloud is required: https://cloud.google.com/sdk/docs/install"
   command -v curl >/dev/null || ai_sre_error "curl is required."
 
@@ -536,8 +607,8 @@ ai_sre_main() {
   echo ""
 
   ai_sre_project_number
+  ai_sre_check_apis
   AI_SRE_CHANGED=true
-  ai_sre_enable_apis "${AI_SRE_POOL_APIS[@]}" "${AI_SRE_APIS[@]}"
   ai_sre_ensure_pool
   ai_sre_ensure_provider
   ai_sre_ensure_service_account
@@ -653,9 +724,9 @@ print_usage() {
 Better Stack AI SRE Setup for Google Cloud
 
 Usage:
-  $(basename "$0") --ai-sre <token> --project <id> [options]
-  $(basename "$0") --ai-sre-remove <provider id> --project <id>
-  $(basename "$0") --help
+  ai-sre-setup.sh --ai-sre <token> --project <id> [options]
+  ai-sre-setup.sh --ai-sre-remove <provider id> --project <id>
+  ai-sre-setup.sh --help
 
   --ai-sre <token>           Registration token from the GCP integration in Better Stack
   --project <id>             Project to connect (required; the one shown in Better Stack)

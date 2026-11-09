@@ -31,10 +31,15 @@ S="$MOCK/state"
 echo "gcloud $*" >>"$MOCK/calls.log"
 ARGS="$*"
 
-# Failure injection: MOCK_FAIL_PATTERN is a regex over the arguments.
+# Failure injection: MOCK_FAIL_PATTERN is a regex over the arguments. With MOCK_FAIL_TIMES,
+# only that many matching calls fail.
 if [ -n "${MOCK_FAIL_PATTERN:-}" ] && [[ "$ARGS" =~ $MOCK_FAIL_PATTERN ]]; then
-  echo "${MOCK_FAIL_MESSAGE:-ERROR: (gcloud) INTERNAL: injected failure}" >&2
-  exit 1
+  failed=$(cat "$S/fail-count" 2>/dev/null || echo 0)
+  if [ -z "${MOCK_FAIL_TIMES:-}" ] || [ "$failed" -lt "$MOCK_FAIL_TIMES" ]; then
+    echo $((failed + 1)) >"$S/fail-count"
+    echo "${MOCK_FAIL_MESSAGE:-ERROR: (gcloud) INTERNAL: injected failure}" >&2
+    exit 1
+  fi
 fi
 
 arg_value() { # arg_value --project
@@ -45,6 +50,13 @@ arg_value() { # arg_value --project
 }
 
 case "$ARGS" in
+  # $S/enabled: one enabled API per line.
+  "services list "*) cat "$S/enabled" 2>/dev/null ;;
+  "services enable "*)
+    for a in $ARGS; do
+      case "$a" in *.googleapis.com) echo "$a" >>"$S/enabled" ;; esac
+    done
+    ;;
   "projects describe "*)
     case "$3" in
       pool-proj) echo "111111111111" ;;
@@ -89,8 +101,13 @@ case "$ARGS" in
   # (MOCK state sa-gone-<email>), but no longer lists the account.
   "iam service-accounts list "*)
     email=$(arg_value --filter); email="${email#email=}"
-    [ -f "$S/sa-$email" ] && echo "$email"
+    if [ -f "$S/sa-disabled-$email" ]; then
+      printf '%s\tTrue\n' "$email"
+    elif [ -f "$S/sa-$email" ]; then
+      echo "$email"
+    fi
     ;;
+  "iam service-accounts enable "*) rm -f "$S/sa-disabled-$4" ;;
   "iam service-accounts describe "*)
     [ -f "$S/sa-gone-$4" ] && { echo "ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist)." >&2; exit 1; }
     [ -f "$S/sa-$4" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
@@ -190,7 +207,8 @@ start_case() {
   rm -rf "$MOCK"
   mkdir -p "$MOCK/state"
   : >"$MOCK/calls.log"
-  unset MOCK_FAIL_PATTERN MOCK_FAIL_MESSAGE MOCK_SA_LAG
+  unset MOCK_FAIL_PATTERN MOCK_FAIL_MESSAGE MOCK_FAIL_TIMES MOCK_SA_LAG
+  enabled_apis "${SERVER_APIS[@]}"
   audience_response 200 "$(first_audience)"
   post_responses "200 {\"status\": \"active\", \"project_ids\": [\"pool-proj\"]}"
 }
@@ -200,6 +218,7 @@ first_audience() {
   echo "{\"audience\": \"$AUDIENCE\", \"caller_service_account\": \"$CALLER\", \"project_id\": \"pool-proj\", \"provider_id\": \"$PROVIDER\", \"pool_project_id\": null, \"pool_project_number\": null, \"service_account_email\": null, \"project_ids\": []}"
 }
 
+enabled_apis() { printf '%s\n' "$@" >"$MOCK/state/enabled"; }
 audience_response() { echo "$1 $2" >"$MOCK/audience.response"; }
 audience_responses() { printf '%s\n' "$@" >"$MOCK/audience.response"; }
 post_responses() { printf '%s\n' "$@" >"$MOCK/post.responses"; }
@@ -243,7 +262,8 @@ assert_call_count() { check "$(grep -cF -- "$1" "$MOCK/calls.log") calls of '$1'
 SA="betterstack-ai-sre@pool-proj.iam.gserviceaccount.com"
 ROLES=(roles/mcp.toolUser roles/logging.viewer roles/monitoring.viewer roles/run.viewer roles/browser
   roles/cloudtrace.user roles/errorreporting.viewer roles/container.viewer)
-SERVER_APIS="logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com cloudtrace.googleapis.com clouderrorreporting.googleapis.com container.googleapis.com"
+SERVER_APIS=(logging.googleapis.com monitoring.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com
+  cloudtrace.googleapis.com clouderrorreporting.googleapis.com container.googleapis.com)
 
 # --- Cases ---
 
@@ -253,7 +273,9 @@ test_first_run() {
   assert_status 0
   assert_call "curl GET https://telemetry.betterstack.com/api/v1/ai-sre/gcp-registrations/audience auth=[Authorization: Bearer $TOKEN]"
   refute_call "config get-value"
-  assert_call "gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com $SERVER_APIS --project=pool-proj"
+  assert_call "gcloud services list --enabled --project=pool-proj"
+  assert_call "gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com --project=pool-proj"
+  refute_output "Not enabled"
   assert_call "gcloud iam workload-identity-pools create betterstack-ai-sre-pool --location=global --project=pool-proj"
   assert_call "gcloud iam workload-identity-pools providers create-oidc $PROVIDER --workload-identity-pool=betterstack-ai-sre-pool --location=global --project=pool-proj --issuer-uri=https://accounts.google.com --allowed-audiences=$AUDIENCE --attribute-mapping=google.subject=assertion.sub,attribute.sa_email=assertion.email --attribute-condition=assertion.email=='$CALLER'"
   refute_call "betterstack-provider"
@@ -594,8 +616,13 @@ test_org_policy_failure() {
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
   assert_output "an organization policy blocks it"
-  assert_output "gcloud resource-manager org-policies allow constraints/iam.workloadIdentityPoolProviders https://accounts.google.com --project=pool-proj"
-  assert_output "roles/orgpolicy.policyAdmin"
+  assert_output "Ask your organization policy admin"
+  assert_output "name: projects/pool-proj/policies/iam.workloadIdentityPoolProviders"
+  assert_output "inheritFromParent: true"
+  assert_output "- https://accounts.google.com"
+  refute_output "org-policies allow"
+  assert_output "If you can't fix it, undo what this command set up in pool-proj:"
+  assert_output "--ai-sre-remove $PROVIDER --project pool-proj"
   refute_call "service-accounts create"
   refute_call "curl POST"
 }
@@ -665,6 +692,7 @@ test_failed_checks_stop_the_setup() {
   assert_output "needs roles/browser on project pool-proj"
   assert_output "If pool-proj isn't the right project ID: this command works only for it. To connect another project, add a Google Cloud integration for it in Better Stack."
   refute_call "services enable"
+  refute_output "undo"
 }
 
 # Setting up again after a removal deleted the service account: it's created anew.
@@ -701,10 +729,14 @@ test_retryable_registration_gives_up() {
   post_responses '422 {"error": "Could not list tools", "retryable": true}'
   run_setup --ai-sre "$TOKEN" --project pool-proj
   assert_status 1
-  # 5 + 10 + 20 + 30 + 30 + 30 + 30 = 155 seconds of waiting, then the next wait would pass 180.
-  assert_call_count "curl POST" 8
-  assert_output "Error: Better Stack could not use the new access after 155 seconds (HTTP 422: Could not list tools)"
-  assert_output "run the same command again"
+  # 5 + 10 + 20 + 18 x 30 = 575 seconds of waiting, then the next wait would pass 600.
+  assert_call_count "curl POST" 22
+  assert_output "Error: Better Stack still can't use the new access after 575 seconds (HTTP 422: Could not list tools)"
+  assert_output "nothing needs fixing"
+  assert_output "Run the same command again in a few minutes: the token works until a run succeeds."
+  refute_output "Fix the problem above"
+  check "the same answer was printed more than once" [ "$(grep -c "Not ready yet (HTTP 422: Could not list tools)" <<<"$OUTPUT")" -eq 1 ]
+  assert_output "Retrying in 30s (waited 545s of up to 600s)..."
   assert_output "To undo what this command set up in pool-proj instead:"
   assert_output "--ai-sre-remove $PROVIDER --project pool-proj"
   refute_output "AI SRE setup complete!"
@@ -835,7 +867,7 @@ test_argument_errors() {
 
   run_setup --help
   assert_status 0
-  assert_output "--ai-sre <token>"
+  assert_output "ai-sre-setup.sh --ai-sre <token> --project <id>"
   assert_output "--audit-logs"
   assert_output "billed"
 }
@@ -968,6 +1000,128 @@ test_audience_charset() {
     assert_output "unexpected audience"
     refute_call "gcloud"
   done
+}
+
+# Only the APIs federation and registration need are turned on; other servers' APIs are named.
+test_apis() {
+  start_case apis_all_on
+  enabled_apis "${SERVER_APIS[@]}" iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  refute_call "services enable"
+  refute_output "Not enabled"
+
+  start_case apis_unused_servers
+  enabled_apis logging.googleapis.com monitoring.googleapis.com
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_call "gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com --project=pool-proj"
+  refute_call "container.googleapis.com"
+  refute_call "run.googleapis.com"
+  assert_output "Not enabled, so AI SRE has nothing to read from these servers here: run cloudresourcemanager cloudtrace clouderrorreporting container."
+
+  start_case apis_logging_off
+  enabled_apis iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_call "gcloud services enable logging.googleapis.com --project=pool-proj"
+  assert_output "Not enabled, so AI SRE has nothing to read from these servers here: monitoring run cloudresourcemanager cloudtrace clouderrorreporting container."
+
+  start_case apis_list_denied
+  export MOCK_FAIL_PATTERN="services list"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission 'serviceusage.services.list' denied on resource (or it may not exist)."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "needs roles/serviceusage.serviceUsageViewer on project pool-proj"
+  refute_call "workload-identity-pools create"
+  refute_output "undo"
+
+  start_case apis_enable_denied
+  export MOCK_FAIL_PATTERN="services enable"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.services.enable) PERMISSION_DENIED: Permission 'serviceusage.services.enable' denied on resource (or it may not exist)."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "needs roles/serviceusage.serviceUsageAdmin on project pool-proj"
+  refute_call "workload-identity-pools create"
+  refute_output "undo"
+}
+
+# Another writer of the project's IAM policy (Terraform, a colleague) makes gcloud's
+# read-modify-write fail: the call is run again.
+test_concurrent_policy_changes_are_retried() {
+  start_case concurrent
+  export MOCK_FAIL_PATTERN="projects add-iam-policy-binding"
+  export MOCK_FAIL_TIMES=2
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.projects.add-iam-policy-binding) ABORTED: There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_call_count "gcloud projects add-iam-policy-binding" 10
+  assert_call_count "sleep 5" 2
+  assert_output "AI SRE setup complete!"
+
+  start_case concurrent_gives_up
+  export MOCK_FAIL_PATTERN="projects add-iam-policy-binding"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.projects.add-iam-policy-binding) ABORTED: There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_call_count "gcloud projects add-iam-policy-binding" 12
+  assert_output "There were concurrent policy changes"
+  assert_output "If you can't fix it, undo what this command set up in pool-proj:"
+  refute_call "curl POST"
+}
+
+# A disabled service account (by hand, or by a policy that disables unused ones) is enabled again,
+# so rerunning the setup repairs the integration.
+test_disabled_service_account_is_enabled() {
+  start_case sa_disabled
+  echo ACTIVE >"$MOCK/state/pool"
+  touch "$MOCK/state/sa-$SA" "$MOCK/state/sa-disabled-$SA"
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_output "Reusing existing service account, which is disabled: enabling it."
+  assert_call "gcloud iam service-accounts enable $SA --project=pool-proj"
+  refute_call "service-accounts create"
+
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 0
+  assert_output "Reusing existing service account."
+  refute_call "service-accounts enable"
+}
+
+# Organization policies that block a step name the policy and who can change it.
+test_other_org_policies() {
+  start_case org_policy_drs
+  export MOCK_FAIL_PATTERN="service-accounts add-iam-policy-binding"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.add-iam-policy-binding) FAILED_PRECONDITION: One or more users named in the policy do not belong to a permitted customer."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "an organization policy blocks it"
+  assert_output "Domain restricted sharing (constraints/iam.allowedPolicyMemberDomains)"
+  assert_output "If you can't fix it, undo what this command set up in pool-proj:"
+  refute_output "permission denied"
+
+  start_case org_policy_sa_creation
+  export MOCK_FAIL_PATTERN="service-accounts create"
+  export MOCK_FAIL_MESSAGE="ERROR: (gcloud.iam.service-accounts.create) FAILED_PRECONDITION: Service account creation is not allowed on this project."
+  run_setup --ai-sre "$TOKEN" --project pool-proj
+  assert_status 1
+  assert_output "constraints/iam.disableServiceAccountCreation doesn't allow creating service accounts"
+  assert_output "If you can't fix it, undo what this command set up in pool-proj:"
+}
+
+# On macOS without the command line tools, python3 exists but can't run.
+test_unusable_python3() {
+  start_case python3
+  mkdir -p "$MOCK/bin"
+  printf '#!/bin/sh\necho "xcrun: error: invalid active developer path" >&2\nexit 1\n' >"$MOCK/bin/python3"
+  chmod +x "$MOCK/bin/python3"
+  : >"$MOCK/calls.log"
+  OUTPUT=$(PATH="$MOCK/bin:$WORK/bin:$PATH" bash "$SCRIPT" --ai-sre "$TOKEN" --project pool-proj 2>&1 </dev/null)
+  STATUS=$?
+  assert_status 1
+  assert_output "python3 is required (on macOS: xcode-select --install)."
+  refute_call "curl"
+  refute_call "gcloud"
 }
 
 # --- Run ---
